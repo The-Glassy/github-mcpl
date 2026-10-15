@@ -1,0 +1,29 @@
+{
+  "ref": "refs/heads/fix-final-batch",
+  "before": "1f0c9a4d2b7e55c3a81d6e40b9f27c3d5a8e1b02",
+  "after": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "compare": "https://github.com/anima-research/rayforce/compare/1f0c9a4d2b7e...4d7b2e8c1a93",
+  "commits": [
+    {
+      "id": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+      "message": "fix(scheduler): guard the drain on an empty queue",
+      "timestamp": "2026-10-13T10:10:50Z",
+      "author": { "name": "Rayforce Clone", "email": "clone@example.invalid", "username": "rayforce-clone[bot]" },
+      "added": [],
+      "removed": [],
+      "modified": ["src/scheduler/tick.rs"]
+    }
+  ],
+  "head_commit": {
+    "id": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+    "message": "fix(scheduler): guard the drain on an empty queue",
+    "timestamp": "2026-10-13T10:10:50Z"
+  },
+  "pusher": { "name": "rayforce-clone[bot]", "email": "clone@example.invalid" },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+  "installation": { "id": 70000001 }
+}

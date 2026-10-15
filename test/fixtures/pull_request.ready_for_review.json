@@ -1,0 +1,27 @@
+{
+  "action": "ready_for_review",
+  "number": 58,
+  "pull_request": {
+    "id": 2300000058,
+    "node_id": "PR_kwDOAAAAAM5hAAAB",
+    "number": 58,
+    "state": "open",
+    "title": "fix(scheduler): dispatch the final batch",
+    "body": "Closes #41. Adds a drain check before the tick returns.",
+    "user": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+    "draft": false,
+    "merged": false,
+    "mergeable": true,
+    "created_at": "2026-10-13T08:00:00Z",
+    "updated_at": "2026-10-13T08:00:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": { "label": "anima-research:fix-final-batch", "ref": "fix-final-batch", "sha": "1f0c9a4d2b7e55c3a81d6e40b9f27c3d5a8e1b02" },
+    "base": { "label": "anima-research:dev", "ref": "dev", "sha": "9ab3c1d7e5f20418b6c93d7a2e1f08c4d6b5a397" },
+    "requested_reviewers": [],
+    "html_url": "https://github.com/anima-research/rayforce/pull/58"
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+  "installation": { "id": 70000001 }
+}

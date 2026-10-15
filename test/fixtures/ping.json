@@ -1,0 +1,14 @@
+{
+  "zen": "Non-blocking is better than blocking.",
+  "hook_id": 2800000001,
+  "hook": {
+    "type": "App",
+    "id": 2800000001,
+    "active": true,
+    "events": ["issues", "issue_comment", "pull_request", "push"],
+    "config": { "content_type": "json", "insecure_ssl": "0", "url": "https://ingress.example.invalid/github/webhook" }
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "octocat", "id": 1001, "type": "User" },
+  "installation": { "id": 70000001 }
+}

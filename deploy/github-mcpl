@@ -1,0 +1,25 @@
+#!/bin/sh
+# github-mcpl launcher (see docs/deploy.md). The MCPL host spawns
+#   /home/<agent>/github-mcpl/deploy/github-mcpl --stdio
+# straight from the checkout, as the agent's own user; the systemd unit runs
+# it with --tcp. It loads the environment file and starts the built server
+# with the Node the file names, so the recipe carries no ids and no paths.
+#
+# Stdout is the JSON-RPC channel: this script must print nothing on it. Keep
+# every diagnostic on stderr (>&2) and never add `set -x`.
+set -eu
+
+ENV_FILE=${GITHUB_MCPL_ENV_FILE:-$HOME/.config/github-mcpl/github-mcpl.env}
+
+if [ ! -r "$ENV_FILE" ]; then
+  echo "github-mcpl: cannot read $ENV_FILE" >&2
+  exit 1
+fi
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+exec "${GITHUB_MCPL_NODE:-node}" "$here/dist/src/index.js" "$@"

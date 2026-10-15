@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "issue": {
+    "id": 2100009999,
+    "number": 3,
+    "title": "Unrelated repository, must be dropped",
+    "user": { "login": "octocat", "id": 1001, "type": "User" },
+    "state": "open",
+    "created_at": "2026-10-13T20:00:00Z",
+    "updated_at": "2026-10-13T20:00:00Z",
+    "body": "This delivery is for a repository outside GITHUB_REPOS.",
+    "html_url": "https://github.com/other-org/other-repo/issues/3"
+  },
+  "repository": {
+    "id": 999888777,
+    "name": "other-repo",
+    "full_name": "other-org/other-repo",
+    "private": false,
+    "owner": { "login": "other-org", "id": 7777, "type": "Organization" },
+    "html_url": "https://github.com/other-org/other-repo",
+    "default_branch": "main"
+  },
+  "sender": { "login": "octocat", "id": 1001, "type": "User" },
+  "installation": { "id": 70000001 }
+}

@@ -1,0 +1,53 @@
+# github-mcpl as a standalone MCPL server on TCP (see docs/deploy.md, "Shape B").
+#
+# Install as /etc/systemd/system/github-mcpl.service, then:
+#   systemctl daemon-reload && systemctl enable --now github-mcpl
+#
+# Replace REPLACE_WITH_AGENT_USER with the user the agent runs as (the one
+# whose home holds ~/github-mcpl and ~/.config/github-mcpl). No secret appears
+# in this file: the launcher loads ~/.config/github-mcpl/github-mcpl.env, which
+# only names the two secret files.
+
+[Unit]
+Description=github-mcpl — GitHub MCPL connector
+Documentation=https://example.com/github-mcpl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_AGENT_USER
+WorkingDirectory=~
+
+# The launcher loads the environment file and starts the built server.
+ExecStart=/home/REPLACE_WITH_AGENT_USER/github-mcpl/deploy/github-mcpl --tcp 9041
+
+Restart=on-failure
+RestartSec=5s
+
+# Diagnostics go to stderr through the Logger and land in the journal.
+# In --tcp mode stdout carries nothing; in --stdio mode it is the JSON-RPC
+# channel and must never reach the journal, which is one more reason this
+# unit runs --tcp and not --stdio.
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=github-mcpl
+
+# The server reads its checkout and two secret files, writes one state file
+# and opens one listening socket. Nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+ReadWritePaths=/home/REPLACE_WITH_AGENT_USER/.config/github-mcpl
+
+[Install]
+WantedBy=multi-user.target
