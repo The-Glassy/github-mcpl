@@ -27,6 +27,7 @@ import {
   parseChannelId,
   parseRepoSlug,
   parseThreadId,
+  allowedBases,
   readConfig,
   repoAllowed,
   reviewSummaryThreadId,
@@ -222,6 +223,45 @@ test('readConfig ignores the webhook secret file while the listener is off', () 
     }),
     (err: unknown) => err instanceof ConfigError && /GITHUB_WEBHOOK_SECRET_FILE: .* is empty/.test(err.message),
   );
+});
+
+test('readConfig accepts several repositories of one owner, and a per-repository base allow-list', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-'));
+  const pem = join(dir, 'app.pem');
+  writeFileSync(pem, 'NOT-A-REAL-KEY placeholder for tests\n', { mode: 0o600 });
+  const base = {
+    GITHUB_APP_ID: '12345',
+    GITHUB_APP_PRIVATE_KEY_FILE: pem,
+    GITHUB_BOT_LOGIN: 'rayforce-clone[bot]',
+  };
+
+  const config = readConfig({
+    ...base,
+    GITHUB_REPOS: 'anima-research/rayforce, anima-research/chronicle',
+    GITHUB_PR_BASE_ALLOW: 'anima-research/rayforce:dev,main',
+  });
+  assert.deepEqual(config.repos, [TEST_REPO, { owner: 'anima-research', name: 'chronicle' }]);
+  assert.deepEqual(allowedBases(TEST_REPO, config.prBaseAllow), ['dev', 'main']);
+  assert.deepEqual(allowedBases({ owner: 'anima-research', name: 'chronicle' }, config.prBaseAllow), ['main']);
+
+  const problems = (env: Record<string, string>): string[] => {
+    try {
+      readConfig({ ...base, ...env });
+    } catch (err) {
+      assert.ok(err instanceof ConfigError);
+      return err.problems;
+    }
+    assert.fail('expected a ConfigError');
+  };
+  // One owner is one App installation and one token; a second owner is a second process.
+  assert.match(problems({ GITHUB_REPOS: 'anima-research/rayforce,other-org/thing' })[0], /must share one owner/);
+  assert.match(problems({ GITHUB_REPOS: 'anima-research/rayforce,anima-research/rayforce' })[0], /listed twice/);
+  // A scoped entry has to name a repository the server serves, so a typo is a startup error.
+  assert.match(
+    problems({ GITHUB_REPOS: 'anima-research/rayforce', GITHUB_PR_BASE_ALLOW: 'anima-research/chronicle:main' })[0],
+    /names a repository outside GITHUB_REPOS/,
+  );
+  assert.match(problems({ GITHUB_REPOS: 'anima-research/rayforce', GITHUB_PR_BASE_ALLOW: 'rayforce:' })[0], /neither a branch nor/);
 });
 
 test('readConfig names every problem at once', () => {

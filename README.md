@@ -1,9 +1,10 @@
 # github-mcpl
 
-An MCPL connector for GitHub. One repository's issues, pull requests,
+An MCPL connector for GitHub. A repository's issues, pull requests,
 comments, reviews and check results reach an agent as **push events** and as
 **channels**, and the agent acts back through **tools** grouped into feature
-sets the host grants (and can roll back).
+sets the host grants (and can roll back). One server serves one repository
+or several of one owner; one process per owner.
 
 - **Wake, not poll-and-hope.** An issue, a comment, a pull request, a review,
   an inline review comment or a failing check suite becomes one normalized
@@ -187,12 +188,14 @@ queueing deliveries nobody collects.
 is parsed, so that secret is the only thing standing between your agent and
 anyone who learns the URL.
 
-### 5. Install it on one repository
+### 5. Install it on the repositories it will serve
 
 **Install App → your account or organisation → Only select repositories →**
-pick exactly one. v1 accepts one repository in `GITHUB_REPOS` and refuses to
-start with more; installing in fewer places is the point, not a limitation to
-work around.
+pick the ones `GITHUB_REPOS` will name, and no more. The allow-list in the
+environment is the second fence; the installation is the first. Start with
+one repository: the agent's prompt and wake policies are easier to get right
+for one, and a second can be added to `GITHUB_REPOS` later without touching
+the App.
 
 ### 6. Check the two secret files
 
@@ -236,8 +239,8 @@ told where Node is instead of looking.
 | `GITHUB_WEBHOOK_PORT` | no | unset = listener off | TCP port of the webhook listener (bind it to loopback, terminate TLS in front). |
 | `GITHUB_WEBHOOK_PATH` | no | `/github/webhook` | Path the listener answers on. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `0` (off) | Polling fallback: issues and PRs, issue comments and review comments updated since the cursor, plus the checks on the heads of the open PRs seen. `0` is off; a non-zero value below `60000` is refused. Partial — it cannot see a submitted review, a review request or a push ([what polling misses](docs/deploy.md#option-3--polling-only-no-webhook-at-all)) — and it is not meant to run alongside the webhook. |
-| `GITHUB_REPOS` | yes | — | Comma-separated `owner/name` allow-list. v1 accepts exactly one; a write anywhere else is refused by name. |
-| `GITHUB_PR_BASE_ALLOW` | no | empty = no PR target allowed | Branches a pull request may target or be retargeted to (for rayforce: `dev`). |
+| `GITHUB_REPOS` | yes | — | Comma-separated `owner/name` allow-list; a write anywhere else is refused by name. Several entries must share one owner (one App installation, one token); a second owner is a second server process. With several, every tool call names its repository. |
+| `GITHUB_PR_BASE_ALLOW` | no | empty = no PR target allowed | Branches a pull request may target or be retargeted to. A plain `branch` applies to every repository, `owner/name:branch` to that one: `anima-research/rayforce:dev,main`. |
 | `GITHUB_STATE_FILE` | no | unset = in-memory only | Durable JSON: checkpoint lineage, rollback bookkeeping, the poll cursor. |
 | `GITHUB_BOT_LOGIN` | yes | — | The App's bot login, e.g. `rayforce-clone[bot]`. From-self and mention detection depend on it. |
 | `GITHUB_MAINTAINERS` | no | empty | Comma-separated logins marked `isMaintainer` in metadata and tagged `github:actor=maintainer`. |
@@ -405,14 +408,16 @@ reach metadata and never reach the model.
   agent's own user, so the agent can read the App private key, as it can its
   other logins. A separate service user would not change that on a host where
   the agent has passwordless `sudo`, which is the usual agent host. What
-  bounds a leaked key is the rest of this list: one repository, the
+  bounds a leaked key is the rest of this list: the repository allow-list, the
   permissions below, no merge. Generating a new key in the App's settings and
   deleting the old one revokes it. [docs/deploy.md](docs/deploy.md#who-can-read-the-key)
   has the cases where isolation is real.
-- **One repository.** `GITHUB_REPOS` is an allow-list, it is required, and v1
-  takes exactly one entry. Events from elsewhere are dropped before they are
-  rendered; writes elsewhere are refused by name. Install the App on one
-  repository too: the allow-list is a second fence, not the first.
+- **An allow-list of repositories.** `GITHUB_REPOS` is required. Events from
+  elsewhere are dropped before they are rendered; writes elsewhere are
+  refused by name. Install the App only on the repositories it names: the
+  allow-list is a second fence, not the first. Several repositories share
+  one agent, one context and one prompt, so keep them to repositories whose
+  rules the prompt can state together.
 - **A base allow-list.** `GITHUB_PR_BASE_ALLOW` is empty by default, which
   means no pull request may be opened or retargeted at all. For rayforce it is
   `dev`, so the release branch is unreachable even by mistake.
@@ -433,8 +438,8 @@ reach metadata and never reach the model.
 
 ## Limits in v1
 
-- **One repository per process.** Two repositories means two installations and
-  two processes.
+- **One owner per process.** Repositories of two owners are two App
+  installations and two tokens; run a process per owner.
 - **No attachments.** `channels/publish` with an attachment is refused with a
   clear error; images in an incoming body stay as the links GitHub put there.
 - **No CI log fetch.** A failing check arrives with its job names and URLs;

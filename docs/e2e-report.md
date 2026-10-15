@@ -617,7 +617,10 @@ and edit, and the dedup ring surviving a restart.
 - **O5 — single repository, single installation.** `GITHUB_REPOS` held exactly
   one repository and the App exactly one installation. Multi-repo allow-lists
   and token refresh across several installations are unexercised; no run lasted
-  long enough to refresh the ~1 h installation token.
+  long enough to refresh the ~1 h installation token. *(Token refresh: covered
+  by the soak below. Several repositories: accepted by the configuration since
+  the multi-repo change, one owner per process, covered by unit tests and not
+  yet by a live run.)*
 - **O6 — scale.** The busiest poll pass handled 6 candidates and delivered 4.
   Pagination bounds, the 50-entry list cap and rate-limit behaviour were never
   approached.

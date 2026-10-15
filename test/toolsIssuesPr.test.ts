@@ -214,7 +214,7 @@ test('create_pull_request refuses a base outside GITHUB_PR_BASE_ALLOW', async ()
     ),
   );
   assert.match(out, /create_pull_request refused: base branch "main" is not in GITHUB_PR_BASE_ALLOW/);
-  assert.match(out, /allowed: dev/);
+  assert.match(out, /allowed on anima-research\/rayforce: dev/);
   assert.equal(api.calls.length, 0, 'nothing reached the API');
 });
 
@@ -227,7 +227,7 @@ test('an empty GITHUB_PR_BASE_ALLOW means no pull request may be opened', async 
       ctx(api, { prBaseAllow: [] }),
     ),
   );
-  assert.match(out, /GITHUB_PR_BASE_ALLOW is empty, so no branch may be targeted/);
+  assert.match(out, /GITHUB_PR_BASE_ALLOW allows no branch on anima-research\/rayforce, so none may be targeted/);
   assert.equal(api.calls.length, 0);
 });
 
@@ -305,10 +305,36 @@ test('request_review rejects an empty or non-string login list', async () => {
   assert.equal(api.calls.length, 0);
 });
 
+test('with several repositories, the base allow-list is read per repository', async () => {
+  const api = new FakeGitHubApi();
+  const second = { owner: TEST_REPO.owner, name: 'chronicle' };
+  const two = ctx(api, {
+    repos: [TEST_REPO, second],
+    // rayforce merges into dev, everything else into main.
+    prBaseAllow: ['anima-research/rayforce:dev', 'main'],
+  });
+  const create = (repo: string, base: string) =>
+    prToolModule.call('create_pull_request', { repo, head: 'fix', base, title: 'Fix' }, two);
+
+  ok(await create('anima-research/rayforce', 'dev'));
+  ok(await create('anima-research/rayforce', 'main'));
+  ok(await create('anima-research/chronicle', 'main'));
+  const refused = failure(await create('anima-research/chronicle', 'dev'));
+  assert.match(refused, /base branch "dev" is not in GITHUB_PR_BASE_ALLOW \(allowed on anima-research\/chronicle: main\)/);
+  assert.equal(api.callsTo('createPullRequest').length, 3);
+
+  // And the repository itself can no longer be left out.
+  const missing = failure(
+    await prToolModule.call('create_pull_request', { head: 'fix', base: 'main', title: 'Fix' }, two),
+  );
+  assert.match(missing, /"repo" is required: GITHUB_REPOS names several repositories/);
+  assert.equal(api.callsTo('createPullRequest').length, 3);
+});
+
 test('requireAllowedBase is the single gate, and it throws a refusal', () => {
   const api = new FakeGitHubApi();
-  assert.equal(requireAllowedBase('dev', ctx(api)), 'dev');
-  assert.throws(() => requireAllowedBase('main', ctx(api)), (err: unknown) => {
+  assert.equal(requireAllowedBase('dev', TEST_REPO, ctx(api)), 'dev');
+  assert.throws(() => requireAllowedBase('main', TEST_REPO, ctx(api)), (err: unknown) => {
     assert.ok(err instanceof ToolRefusal);
     assert.match((err as Error).message, /not in GITHUB_PR_BASE_ALLOW/);
     return true;
