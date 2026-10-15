@@ -91,7 +91,7 @@ supervision. Pick one.
 
 ### Shape A — the host spawns it over stdio (e.g. connectome-host)
 
-This is what [`examples/recipe-rayforce.json`](../examples/recipe-rayforce.json)
+This is what [`examples/recipe-maintainer-clone.json`](../examples/recipe-maintainer-clone.json)
 describes and what connectome-host supports today: the host spawns the
 launcher as a child process, as its own user, and speaks JSON-RPC over the
 pipe.

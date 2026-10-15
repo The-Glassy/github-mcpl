@@ -189,7 +189,13 @@ The contract names the variables but not every default or requiredness.
 - `GITHUB_PR_BASE_ALLOW` is optional and defaults to empty, which means no
   branch is an allowed PR target: `create_pull_request` and a base change in
   `edit_pull_request` then refuse. Deny-by-default; an operator who wants PRs
-  names the branch.
+  names the branch. An entry is `branch` (every repository) or
+  `owner/name:branch` (that one); a scoped entry outside `GITHUB_REPOS` is a
+  startup error.
+- `GITHUB_REPOS` took exactly one entry in v1. It now takes several of one
+  owner: one owner is one App installation and one token, which is what the
+  adapter holds. With several entries the tools' `repo` argument and the
+  repository half of `thread` stop defaulting and become required.
 - `GITHUB_STATE_FILE` is optional; absent means the state lives in memory for
   the life of the process and `flush()` is a no-op. Checkpoints still work,
   they just do not survive a restart.

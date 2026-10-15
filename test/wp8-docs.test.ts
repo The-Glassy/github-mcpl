@@ -55,7 +55,7 @@ const METADATA_BOOLEANS = [
 ] as const satisfies readonly (keyof EventMetadata)[];
 
 const KNOWN_TAGS: readonly string[] = [...CORE_TAGS, ...GITHUB_TAGS];
-const RECIPES = ['examples/recipe-rayforce.json', 'examples/recipe-anima.json'];
+const RECIPES = ['examples/recipe-maintainer-clone.json', 'examples/recipe-contributor.json'];
 
 // ─── 1. the App manifest ─────────────────────────────────────────────────────
 
@@ -174,8 +174,8 @@ for (const rel of RECIPES) {
   });
 }
 
-test('recipe-rayforce.json debounces newly opened issues and pull requests', () => {
-  const policies = json('examples/recipe-rayforce.json').modules.wake.policies;
+test('recipe-maintainer-clone.json debounces newly opened issues and pull requests', () => {
+  const policies = json('examples/recipe-maintainer-clone.json').modules.wake.policies;
   const debounced = policies.find((p: any) => typeof p.behavior === 'object' && 'debounce' in p.behavior);
   assert.ok(debounced, 'a burst of new threads must not be one wake each');
   assert.equal(debounced.behavior.debounce, 60000);
@@ -197,7 +197,6 @@ test('the operator surface carries no secret material', () => {
     'README.md',
     'app-manifest.json',
     'docs/deploy.md',
-    'docs/rayforce-house-rules.md',
     'deploy/github-mcpl.service',
     'deploy/github-mcpl.env.example',
     'deploy/github-mcpl',

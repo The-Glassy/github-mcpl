@@ -224,6 +224,21 @@ test('a first pass with no cursor looks back exactly one interval', async () => 
   assert.equal(result.since, '2026-10-13T23:55:00.000Z');
 });
 
+test('every allow-listed repository is polled, in one pass', async () => {
+  const api = new FakeGitHubApi();
+  const second = { owner: TEST_REPO.owner, name: 'chronicle' };
+  api.seedIssue({ repo: TEST_REPO, number: 41, updatedAt: '2026-10-13T12:00:00.000Z' });
+  api.seedIssue({ repo: second, number: 3, updatedAt: '2026-10-13T12:00:01.000Z' });
+  api.seedIssue({ repo: OTHER_REPO, number: 9, updatedAt: '2026-10-13T12:00:02.000Z' });
+  const r = rig({ api, repos: [TEST_REPO, second] });
+  const result = await r.poller.pollOnce();
+  assert.deepEqual(
+    result.delivered.map((e) => [e.repo.name, e.thread?.number]),
+    [['rayforce', 41], ['chronicle', 3]],
+  );
+  assert.deepEqual(r.state.snapshot().pollKeys, ['issue:41:2026-10-13T12:00:00.000Z', 'issue:3:2026-10-13T12:00:01.000Z']);
+});
+
 test('only the allow-listed repositories are ever asked', async () => {
   const api = new FakeGitHubApi();
   api.seedIssue({ repo: TEST_REPO, number: 41, updatedAt: '2026-10-13T12:00:00.000Z' });

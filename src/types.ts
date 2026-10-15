@@ -496,7 +496,7 @@ export interface ToolContext {
   botLogin: string;
   /** GITHUB_REPOS; a write outside it is refused by name. */
   repos: readonly RepoRef[];
-  /** GITHUB_PR_BASE_ALLOW; the only branches a PR may target. */
+  /** GITHUB_PR_BASE_ALLOW entries, as written; {@link allowedBases} resolves them per repository. */
   prBaseAllow: readonly string[];
   logger: Logger;
 }
@@ -926,9 +926,17 @@ export interface Config {
   webhookPath: string;
   /** 0 = repository polling off. Never below {@link MIN_POLL_INTERVAL_MS} when on. */
   pollIntervalMs: number;
-  /** GITHUB_REPOS, the write allow-list. v1 accepts exactly one. */
+  /**
+   * GITHUB_REPOS, the write allow-list. Several repositories are accepted as
+   * long as they share one owner, which is one App installation and so one
+   * token; a second owner is a second server process.
+   */
   repos: RepoRef[];
-  /** GITHUB_PR_BASE_ALLOW. Empty means no PR may be created or retargeted. */
+  /**
+   * GITHUB_PR_BASE_ALLOW, as written: `branch` applies to every repository,
+   * `owner/name:branch` to that one. Empty means no PR may be created or
+   * retargeted. {@link allowedBases} answers for one repository.
+   */
   prBaseAllow: string[];
   stateFile: string | null;
   botLogin: string;
@@ -965,6 +973,24 @@ export class ConfigError extends Error {
 }
 
 export type Env = Record<string, string | undefined>;
+
+/**
+ * The branches a pull request on `repo` may target: every plain entry of
+ * GITHUB_PR_BASE_ALLOW plus the `owner/name:branch` entries scoped to this
+ * repository. Order and duplicates as written; the caller only asks `includes`.
+ */
+export function allowedBases(repo: RepoRef, entries: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const entry of entries) {
+    const at = entry.indexOf(':');
+    if (at < 0) out.push(entry);
+    else {
+      const scope = parseRepoSlug(entry.slice(0, at));
+      if (scope && repoAllowed(scope, [repo])) out.push(entry.slice(at + 1));
+    }
+  }
+  return out;
+}
 
 function csv(raw: string | undefined): string[] {
   return (raw ?? '')
@@ -1092,8 +1118,28 @@ export function readConfig(env: Env = process.env): Config {
       if (!repo) problems.push(`GITHUB_REPOS: "${slug}" is not owner/name`);
       else repos.push(repo);
     }
-    if (rawRepos.length > 1) {
-      problems.push(`GITHUB_REPOS: v1 accepts exactly one repository, got ${rawRepos.length}`);
+    const slugs = repos.map(repoSlug);
+    const dup = slugs.find((s, i) => slugs.indexOf(s) !== i);
+    if (dup) problems.push(`GITHUB_REPOS: ${dup} is listed twice`);
+    const owners = [...new Set(repos.map((r) => r.owner))];
+    if (owners.length > 1) {
+      problems.push(
+        `GITHUB_REPOS: every repository must share one owner (one App installation, one token); ` +
+          `got ${owners.join(', ')}. Run one server per owner.`,
+      );
+    }
+  }
+
+  const prBaseAllow = csv(env.GITHUB_PR_BASE_ALLOW);
+  for (const entry of prBaseAllow) {
+    const at = entry.indexOf(':');
+    if (at < 0) continue;
+    const scope = parseRepoSlug(entry.slice(0, at));
+    const branch = entry.slice(at + 1);
+    if (!scope || !branch) {
+      problems.push(`GITHUB_PR_BASE_ALLOW: "${entry}" is neither a branch nor owner/name:branch`);
+    } else if (repos.length > 0 && !repoAllowed(scope, repos)) {
+      problems.push(`GITHUB_PR_BASE_ALLOW: "${entry}" names a repository outside GITHUB_REPOS`);
     }
   }
 
@@ -1113,7 +1159,7 @@ export function readConfig(env: Env = process.env): Config {
     webhookPath,
     pollIntervalMs,
     repos,
-    prBaseAllow: csv(env.GITHUB_PR_BASE_ALLOW),
+    prBaseAllow,
     stateFile: env.GITHUB_STATE_FILE?.trim() || null,
     botLogin,
     maintainers: csv(env.GITHUB_MAINTAINERS),

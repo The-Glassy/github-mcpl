@@ -249,7 +249,12 @@ export function resolveRepo(args: Record<string, unknown>, ctx: ToolContext): Re
     throw new ToolArgumentError('GITHUB_REPOS names no repository, so there is nothing to act on');
   }
   const raw = optionalString(args, 'repo');
-  if (raw === undefined || raw.trim() === '') return allowed[0];
+  if (raw === undefined || raw.trim() === '') {
+    if (allowed.length === 1) return allowed[0];
+    throw new ToolArgumentError(
+      `"repo" is required: GITHUB_REPOS names several repositories (${boundedInline(allowed.map(repoSlug), FIELD.slug)})`,
+    );
+  }
   const repo = parseRepoSlug(raw);
   if (!repo) throw new ToolArgumentError(`"repo" must be owner/name, got ${echo(raw, FIELD.slug)}`);
   return requireAllowedRepo(repo, allowed);
@@ -283,8 +288,8 @@ export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string };
  * Which issue or pull request a call acts on, from every form the two tool
  * families accept:
  *
- *   - `12` or `"12"` or `"#12"` — the number, in the single repository
- *     GITHUB_REPOS names;
+ *   - `12` or `"12"` or `"#12"` — the number, in the one repository
+ *     GITHUB_REPOS names; with several, the repository has to be spelled;
  *   - `"owner/name#12"` and `"github:owner/name#12"` — the channel id's own
  *     spelling, so a thread can be named exactly as an event named it;
  *   - `{ owner, name, number, kind }`, or `{ repo: "owner/name", number }`,
@@ -378,8 +383,8 @@ export function resolveThread(args: Record<string, unknown>, ctx: ToolContext, k
 export const REPO_PROPERTY = {
   type: 'string',
   description:
-    'Repository as owner/name. Optional: defaults to the single repository GITHUB_REPOS allows. ' +
-    'Any other repository is refused by name.',
+    'Repository as owner/name. Optional when GITHUB_REPOS names one repository (it is then the default); ' +
+    'required when it names several. Any repository outside GITHUB_REPOS is refused by name.',
 } as const;
 
 export const NUMBER_PROPERTY = {

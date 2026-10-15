@@ -704,10 +704,12 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * GITHUB_APP_INSTALLATION_ID, or the installation the App has on the
-   * GITHUB_REPOS entry. The lookup is the repository's own installation
-   * endpoint, which is the App's installation for that repository by
-   * definition; discovering it once is enough, an installation id is stable.
+   * GITHUB_APP_INSTALLATION_ID, or the installation the App has on the first
+   * GITHUB_REPOS entry. Every entry shares that owner (readConfig refuses a
+   * second one), and an App is installed on an owner once, so the first
+   * repository's installation is every repository's. The lookup is the
+   * repository's own installation endpoint; discovering it once is enough, an
+   * installation id is stable.
    */
   private async resolveInstallationId(): Promise<number> {
     if (this.installationIdCache !== null) return this.installationIdCache;

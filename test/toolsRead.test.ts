@@ -209,6 +209,19 @@ test('get_issue reads an issue and defaults the repository', async () => {
   assert.deepEqual(api.callsTo('getIssue')[0].args, [ISSUE]);
 });
 
+test('with several repositories, a read has to name one', async () => {
+  const api = new FakeGitHubApi();
+  const second = { owner: TEST_REPO.owner, name: 'chronicle' };
+  api.seedIssue({ number: 7, title: 'In rayforce' });
+  api.seedIssue({ repo: second, number: 7, title: 'In chronicle' });
+  const two = ctx(api, { repos: [TEST_REPO, second] });
+
+  assert.match(failure(await readToolModule.call('get_issue', { number: 7 }, two)), /"repo" is required: GITHUB_REPOS names several/);
+  assert.match(failure(await readToolModule.call('get_issue', { thread: '#7' }, two)), /name the repository as owner\/name#7/);
+  assert.match(ok(await readToolModule.call('get_issue', { repo: 'anima-research/chronicle', number: 7 }, two)), /In chronicle/);
+  assert.match(ok(await readToolModule.call('get_issue', { thread: 'anima-research/rayforce#7' }, two)), /In rayforce/);
+});
+
 test('get_pull_request reports refs, mergeability and checks', async () => {
   const api = new FakeGitHubApi();
   api.seedPullRequest({

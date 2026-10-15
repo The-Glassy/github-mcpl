@@ -29,8 +29,10 @@ import {
   TOOL_EDIT_PULL_REQUEST,
   TOOL_REOPEN_ISSUE,
   TOOL_REQUEST_REVIEW,
+  allowedBases,
   repoSlug,
   type IssueStateReason,
+  type RepoRef,
   type ToolContext,
   type ToolDefinition,
   type ToolModule,
@@ -66,15 +68,17 @@ import {
 const CLOSE_REASONS: readonly IssueStateReason[] = ['completed', 'not_planned'];
 
 /**
- * GITHUB_PR_BASE_ALLOW, enforced. The refusal names the branch asked for and
- * the branches allowed, so the caller can correct it in one step.
+ * GITHUB_PR_BASE_ALLOW, enforced for one repository (`allowedBases`). The
+ * refusal names the branch asked for and the branches allowed there, so the
+ * caller can correct it in one step.
  */
-export function requireAllowedBase(base: string, ctx: ToolContext): string {
-  if (ctx.prBaseAllow.includes(base)) return base;
+export function requireAllowedBase(base: string, repo: RepoRef, ctx: ToolContext): string {
+  const bases = allowedBases(repo, ctx.prBaseAllow);
+  if (bases.includes(base)) return base;
   const allowed =
-    ctx.prBaseAllow.length === 0
-      ? 'GITHUB_PR_BASE_ALLOW is empty, so no branch may be targeted'
-      : `allowed: ${boundedInline(ctx.prBaseAllow)}`;
+    bases.length === 0
+      ? `GITHUB_PR_BASE_ALLOW allows no branch on ${repoSlug(repo)}, so none may be targeted`
+      : `allowed on ${repoSlug(repo)}: ${boundedInline(bases)}`;
   refuse(`base branch ${echo(base)} is not in GITHUB_PR_BASE_ALLOW (${allowed})`);
 }
 
@@ -256,7 +260,7 @@ async function callPr(name: string, args: Record<string, unknown>, ctx: ToolCont
   switch (name) {
     case TOOL_CREATE_PULL_REQUEST: {
       const repo = resolveRepo(args, ctx);
-      const base = requireAllowedBase(requireString(args, 'base'), ctx);
+      const base = requireAllowedBase(requireString(args, 'base'), repo, ctx);
       const pull = await ctx.api.createPullRequest(repo, {
         head: requireString(args, 'head'),
         base,
@@ -272,7 +276,7 @@ async function callPr(name: string, args: Record<string, unknown>, ctx: ToolCont
       const input: UpdatePullRequestInput = {
         title: optionalString(args, 'title'),
         body: optionalString(args, 'body'),
-        base: base === undefined ? undefined : requireAllowedBase(base, ctx),
+        base: base === undefined ? undefined : requireAllowedBase(base, thread.repo, ctx),
         draft: optionalBoolean(args, 'draft'),
       };
       if (

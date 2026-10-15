@@ -12,8 +12,9 @@
  *
  *   - **`thread`** accepts `{ owner?, name?, number, kind? }` or the string
  *     forms `owner/name#12`, `github:owner/name#12`, `#12`, `12`. Owner and
- *     name default to the single entry of GITHUB_REPOS (v1 accepts exactly
- *     one); `kind` defaults to `issue`, which is also the REST path issue
+ *     name default to the entry of GITHUB_REPOS when it holds one, and are
+ *     required when it holds several; `kind` defaults to `issue`, which is
+ *     also the REST path issue
  *     comments take on a pull request.
  *   - **`edit_own_comment` and `delete_own_comment` take `thread` as well as
  *     `commentId`, and an optional `review`.** `GitHubApi` has no
