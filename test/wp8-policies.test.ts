@@ -183,7 +183,7 @@ const push: GateEventInfo = {
 
 // ─── what both recipes must do ───────────────────────────────────────────────
 
-for (const name of ['recipe-rayforce.json', 'recipe-anima.json']) {
+for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json']) {
   test(`${name}: a green build on the agent's own thread does not wake it`, { skip: gatePath ? false : skipReason }, async () => {
     const d = (await gateFor(name)).probe(ownThreadCiSuccess);
     assert.equal(d.trigger, false, `woke via ${d.policyName}`);
@@ -230,21 +230,21 @@ for (const name of ['recipe-rayforce.json', 'recipe-anima.json']) {
 
 // ─── where they differ ───────────────────────────────────────────────────────
 
-test('recipe-rayforce.json: a human opening a pull request debounces, it does not wake at once', { skip: gatePath ? false : skipReason }, async () => {
-  const d = (await gateFor('recipe-rayforce.json')).probe(humanOpenedPull);
+test('recipe-maintainer-clone.json: a human opening a pull request debounces, it does not wake at once', { skip: gatePath ? false : skipReason }, async () => {
+  const d = (await gateFor('recipe-maintainer-clone.json')).probe(humanOpenedPull);
   assert.equal(d.policyName, 'github-new-work');
   assert.deepEqual(d.behavior, { debounce: 60000 });
   assert.equal(d.trigger, false, 'a debounce never triggers inline; it fires once the burst settles');
 });
 
-test('recipe-anima.json: a human opening a pull request is ambient, the contributor does not triage', { skip: gatePath ? false : skipReason }, async () => {
-  const d = (await gateFor('recipe-anima.json')).probe(humanOpenedPull);
+test('recipe-contributor.json: a human opening a pull request is ambient, the contributor does not triage', { skip: gatePath ? false : skipReason }, async () => {
+  const d = (await gateFor('recipe-contributor.json')).probe(humanOpenedPull);
   assert.equal(d.trigger, false);
   assert.equal(d.policyName, 'github-ambient');
 });
 
-test('recipe-anima.json: a thread the agent took part in wakes it, issue or pull request', { skip: gatePath ? false : skipReason }, async () => {
-  const gate = await gateFor('recipe-anima.json');
+test('recipe-contributor.json: a thread the agent took part in wakes it, issue or pull request', { skip: gatePath ? false : skipReason }, async () => {
+  const gate = await gateFor('recipe-contributor.json');
   for (const kind of ['issue', 'pull'] as const) {
     const d = gate.probe({
       ...base,

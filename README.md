@@ -259,10 +259,11 @@ deploy/github-mcpl --stdio < /dev/null
 ```
 
 The host starts it for you from then on. Copy
-[`examples/recipe-rayforce.json`](examples/recipe-rayforce.json) (maintainer's
-clone, full tool surface) or
-[`examples/recipe-anima.json`](examples/recipe-anima.json) (contributor-side
-resident: mentions, review requests and the threads it has taken part in)
+[`examples/recipe-maintainer-clone.json`](examples/recipe-maintainer-clone.json)
+(maintainer's clone, full tool surface) or
+[`examples/recipe-contributor.json`](examples/recipe-contributor.json)
+(contributor-side resident: mentions, review requests and the threads it has
+taken part in)
 into your host recipe: both carry the `mcpServers.github` entry — the
 launcher's absolute path and `--stdio`, nothing else, since every value comes
 from the environment file — and a `modules.wake` policy set sized for
@@ -293,7 +294,7 @@ exception next, and the wake rules last:
 | 3 | `github-other-bots` | `chat:from-bot`, without `chat:mention` or `github:ci=failure` | `skip` — dependabot does not get a turn |
 | 4 | `github-ci-failure-own-thread` | `github:ci=failure` **and** `isOwnThread` | `always` — the exception rules 2 and 3 leave room for |
 | 5 | `github-direct-address` | `mentioned`, `isReviewRequested`, `isOwnThread`, `isReplyToSelf` | `always` |
-| 6 | `github-new-work` (rayforce only) | `github:issue=opened`, `github:pr=opened` | `debounce: 60000` — one wake once the burst settles |
+| 6 | `github-new-work` (maintainer clone only) | `github:issue=opened`, `github:pr=opened` | `debounce: 60000` — one wake once the burst settles |
 | 7 | `github-ambient` | anything else from `github` | `skip`, and `default` is `skip` too |
 
 `test/wp8-policies.test.ts` runs both recipes through connectome-host's own
@@ -478,7 +479,8 @@ the network.
 
 Changelog entries land as fragments in [`changelog.d/`](changelog.d/README.md).
 Contract decisions taken where TASK-SRHKG.1's contract left a type
-under-specified are in [`docs/contract-notes.md`](docs/contract-notes.md). The
-repository's own operating notes for the rayforce installation — branch model,
-commit style, CI gates, review rounds, issue style — are in
-[`docs/rayforce-house-rules.md`](docs/rayforce-house-rules.md).
+under-specified are in [`docs/contract-notes.md`](docs/contract-notes.md). A
+target repository's own operating notes — branch model, commit style, CI
+gates, review rounds, issue style — belong with the host's deployment, beside
+its recipe, not in this repository: the connector enforces none of them, and
+the agent's prompt is where they take effect.
