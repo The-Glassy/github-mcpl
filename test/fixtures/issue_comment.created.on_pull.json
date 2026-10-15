@@ -1,0 +1,31 @@
+{
+  "action": "created",
+  "issue": {
+    "id": 2100000055,
+    "number": 58,
+    "title": "fix(scheduler): dispatch the final batch",
+    "user": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+    "state": "open",
+    "comments": 1,
+    "pull_request": {
+      "url": "https://api.github.com/repos/anima-research/rayforce/pulls/58",
+      "html_url": "https://github.com/anima-research/rayforce/pull/58"
+    },
+    "created_at": "2026-10-13T08:00:00Z",
+    "updated_at": "2026-10-13T09:05:00Z",
+    "body": "Closes #41.",
+    "html_url": "https://github.com/anima-research/rayforce/pull/58"
+  },
+  "comment": {
+    "id": 2200000031,
+    "user": { "login": "octocat", "id": 1001, "type": "User" },
+    "created_at": "2026-10-13T09:05:00Z",
+    "updated_at": "2026-10-13T09:05:00Z",
+    "body": "Looks right. One nit in the review.",
+    "html_url": "https://github.com/anima-research/rayforce/pull/58#issuecomment-2200000031",
+    "issue_url": "https://api.github.com/repos/anima-research/rayforce/issues/58"
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "octocat", "id": 1001, "type": "User" },
+  "installation": { "id": 70000001, "node_id": "MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uNzAwMDAwMDE=" }
+}

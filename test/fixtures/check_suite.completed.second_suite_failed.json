@@ -1,0 +1,27 @@
+{
+  "action": "completed",
+  "check_suite": {
+    "id": 2600000903,
+    "head_branch": "fix-final-batch",
+    "head_sha": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+    "status": "completed",
+    "conclusion": "failure",
+    "before": "1f0c9a4d2b7e55c3a81d6e40b9f27c3d5a8e1b02",
+    "after": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+    "latest_check_runs_count": 1,
+    "pull_requests": [
+      {
+        "id": 2300000058,
+        "number": 58,
+        "head": { "ref": "fix-final-batch", "sha": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418" },
+        "base": { "ref": "dev", "sha": "9ab3c1d7e5f20418b6c93d7a2e1f08c4d6b5a397" }
+      }
+    ],
+    "app": { "id": 15370, "slug": "test-workflow-app", "name": "Test Workflow" },
+    "created_at": "2026-10-13T10:11:07Z",
+    "updated_at": "2026-10-13T10:24:02Z"
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+  "installation": { "id": 70000001 }
+}

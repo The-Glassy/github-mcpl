@@ -1,0 +1,36 @@
+{
+  "action": "created",
+  "comment": {
+    "id": 2500000077,
+    "node_id": "PRRC_kwDOAAAAAM5jAABN",
+    "pull_request_review_id": 2400000012,
+    "user": { "login": "octocat", "id": 1001, "type": "User" },
+    "body": "This drains twice when the queue was already empty.",
+    "path": "src/scheduler/tick.rs",
+    "position": 12,
+    "original_position": 12,
+    "line": 118,
+    "original_line": 118,
+    "start_line": null,
+    "side": "RIGHT",
+    "commit_id": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418",
+    "diff_hunk": "@@ -112,6 +112,10 @@ impl Tick {\n     fn finish(&mut self) {\n+        self.drain_pending();\n     }",
+    "in_reply_to_id": null,
+    "created_at": "2026-10-13T12:20:01Z",
+    "updated_at": "2026-10-13T12:20:01Z",
+    "html_url": "https://github.com/anima-research/rayforce/pull/58#discussion_r2500000077"
+  },
+  "pull_request": {
+    "id": 2300000058,
+    "number": 58,
+    "state": "open",
+    "title": "fix(scheduler): dispatch the final batch",
+    "user": { "login": "rayforce-clone[bot]", "id": 9001, "type": "Bot" },
+    "head": { "ref": "fix-final-batch", "sha": "4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418" },
+    "base": { "ref": "dev", "sha": "9ab3c1d7e5f20418b6c93d7a2e1f08c4d6b5a397" },
+    "html_url": "https://github.com/anima-research/rayforce/pull/58"
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "octocat", "id": 1001, "type": "User" },
+  "installation": { "id": 70000001 }
+}

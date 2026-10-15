@@ -1,0 +1,18 @@
+{
+  "action": "completed",
+  "check_suite": {
+    "id": 2600000901,
+    "head_branch": "dev",
+    "head_sha": "9ab3c1d7e5f20418b6c93d7a2e1f08c4d6b5a397",
+    "status": "completed",
+    "conclusion": "success",
+    "latest_check_runs_count": 3,
+    "pull_requests": [],
+    "app": { "id": 15368, "slug": "github-actions", "name": "GitHub Actions" },
+    "created_at": "2026-10-13T17:41:00Z",
+    "updated_at": "2026-10-13T17:49:12Z"
+  },
+  "repository": { "id": 100200300, "name": "rayforce", "full_name": "anima-research/rayforce", "private": true, "owner": { "login": "anima-research", "id": 4001, "type": "Organization" }, "html_url": "https://github.com/anima-research/rayforce", "default_branch": "dev" },
+  "sender": { "login": "octocat", "id": 1001, "type": "User" },
+  "installation": { "id": 70000001 }
+}
