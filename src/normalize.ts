@@ -26,6 +26,7 @@ import {
   type NormalizedEventKind,
   type PolledComment,
   type PolledIssue,
+  type PolledReview,
   type RepoRef,
   type ReviewState,
   type ThreadKind,
@@ -52,8 +53,10 @@ export interface WebhookDelivery {
 /**
  * Which `since` query a poll row came from. Part of the dedup key and of the
  * poll event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1).
+ * `review` is contributor mode's notifications poller only: a submitted
+ * review, which the repository poll never fetches.
  */
-export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks';
+export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks' | 'review';
 
 /** `<kind>:<id>:<updated_at>` — what `StateStore.seenPollKey` remembers. */
 export function pollKey(kind: PollRowKind, id: number | string, updatedAt: string): string {
@@ -600,6 +603,36 @@ export function normalizePolledComment(
           },
         }
       : {}),
+    raw: row,
+  };
+}
+
+/**
+ * A submitted review from `listReviewsSince` (contributor mode's notifications
+ * poller only — the repository poll has no equivalent, since `since` on this
+ * endpoint is a client-side filter the adapter applies itself). Same shape as
+ * the webhook's `pull_request_review` case in {@link normalizeWebhook}: one
+ * `review.submitted` event, so a notification and a webhook delivery of the
+ * same review tag and render identically.
+ */
+export function normalizePolledReview(
+  repo: RepoRef,
+  pull: ThreadRef,
+  row: PolledReview,
+  receivedAt: string,
+): NormalizedEvent {
+  const key = pollKey('review', row.id, row.submittedAt);
+  return {
+    id: pollEventId(key),
+    receivedAt,
+    repo,
+    kind: 'review.submitted',
+    thread: pull,
+    actor: row.author,
+    body: row.body,
+    html_url: row.html_url,
+    ...(row.commitId === undefined ? {} : { sha: row.commitId }),
+    review: { id: row.id, state: row.state },
     raw: row,
   };
 }

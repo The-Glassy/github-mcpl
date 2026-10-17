@@ -390,9 +390,11 @@ test('neither a log line nor a response body ever carries the webhook secret', a
 
 function config(overrides: Partial<Config> = {}): Config {
   return {
+    authMode: 'app',
     appId: '12345',
     privateKeyPem: '(not a key)',
     installationId: null,
+    userToken: null,
     webhookSecret: SECRET,
     webhookPort: 8081,
     webhookPath: '/github/webhook',

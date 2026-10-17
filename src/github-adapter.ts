@@ -55,6 +55,7 @@ import {
   type Logger,
   type PolledComment,
   type PolledIssue,
+  type PolledReview,
   type PullRequest,
   type PullRequestFile,
   type RepoRef,
@@ -62,6 +63,7 @@ import {
   type ReviewThread,
   type ReviewThreadComment,
   type SubmittedReview,
+  type ThreadKind,
   type ThreadRef,
   type UpdateIssueInput,
   type UpdatePullRequestInput,
@@ -295,6 +297,51 @@ interface ApiComment {
   pull_request_url?: string | null;
 }
 
+/** One row of `GET /repos/{o}/{r}/pulls/{n}/reviews`. */
+interface ApiReview {
+  id?: number;
+  user?: ApiActor | null;
+  body?: string | null;
+  state?: string | null;
+  submitted_at?: string | null;
+  html_url?: string | null;
+  commit_id?: string | null;
+}
+
+/** One row of `GET /notifications`. */
+interface ApiNotification {
+  id?: string;
+  updated_at?: string | null;
+  reason?: string | null;
+  unread?: boolean;
+  subject?: { type?: string | null; url?: string | null; title?: string | null } | null;
+  repository?: { full_name?: string | null; owner?: { login?: string | null } | null; name?: string | null } | null;
+}
+
+/** One row of `GET /notifications`, mapped: the ingress-only shape the poller reads. */
+export interface NotificationRow {
+  id: string;
+  updatedAt: string;
+  reason: string;
+  unread: boolean;
+  repo: RepoRef;
+  /** `issue` or `pull`; `null` for a subject kind this ingress does not map (e.g. `Discussion`, `Commit`). */
+  kind: ThreadKind | null;
+  number: number | null;
+  title: string;
+}
+
+/** One page of `GitHubAdapter.listNotifications`. */
+export interface NotificationsPage {
+  notifications: NotificationRow[];
+  /** True on a 304: `notifications` is empty and nothing changed since `ifModifiedSince`. */
+  notModified: boolean;
+  /** `Last-Modified`, to pass back as the next call's `ifModifiedSince`. */
+  lastModified: string | null;
+  /** `X-Poll-Interval`, in seconds, when GitHub sent one. */
+  pollIntervalSeconds: number | null;
+}
+
 /** One row of `GET /repos/{o}/{r}/commits/{sha}/check-runs`. */
 export interface CheckRunRow {
   name?: string;
@@ -434,11 +481,20 @@ export class GitHubAdapter implements GitHubApi {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly baseFetch: typeof globalThis.fetch;
-  private readonly privateKey: KeyObject;
+  /** App mode only: null in contributor mode, which mints nothing. */
+  private readonly privateKey: KeyObject | null;
+  /** Contributor mode only: the static token every call authenticates with. */
+  private readonly userToken: string | null;
 
-  /** JWT-authenticated: `/app`, installation discovery, token minting. */
-  private readonly appOctokit: Octokit;
-  /** Installation-token-authenticated: everything the tools and channels do. */
+  /**
+   * JWT-authenticated: `/app`, installation discovery, token minting. Null in
+   * contributor mode, which has no App identity to JWT-authenticate as.
+   */
+  private readonly appOctokit: Octokit | null;
+  /**
+   * App mode: installation-token-authenticated. Contributor mode: the user
+   * token directly. Either way, everything the tools and channels do.
+   */
   private readonly octokit: Octokit;
 
   private jwtCache: { token: string; expiresAt: number } | null = null;
@@ -484,9 +540,6 @@ export class GitHubAdapter implements GitHubApi {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     const base = options.fetch ?? globalThis.fetch;
     this.baseFetch = (input, init) => base(input, init);
-    // Throws on a malformed PEM before any call is made, and the KeyObject is
-    // the only form of the key that is kept.
-    this.privateKey = createPrivateKey(config.privateKeyPem);
     this.installationIdCache = config.installationId;
 
     const octokitLog = this.octokitLog();
@@ -505,17 +558,39 @@ export class GitHubAdapter implements GitHubApi {
       // warnings use, and that one defaults to `console`.
       log: octokitLog,
     };
-    this.appOctokit = new Octokit({
-      ...common,
-      request: { fetch: this.authedFetch(async () => `Bearer ${await this.appJwt()}`), log: octokitLog },
-    });
-    this.octokit = new Octokit({
-      ...common,
-      request: {
-        fetch: this.authedFetch(async () => `token ${await this.installationToken()}`),
-        log: octokitLog,
-      },
-    });
+
+    if (config.authMode === 'token') {
+      // Contributor mode: one static token, straight from GITHUB_TOKEN_FILE.
+      // No JWT, no installation, nothing to mint or refresh — so there is no
+      // App octokit and no private key to parse.
+      this.privateKey = null;
+      this.userToken = config.userToken as string;
+      this.appOctokit = null;
+      this.octokit = new Octokit({
+        ...common,
+        request: { fetch: this.authedFetch(async () => `token ${this.userToken as string}`), log: octokitLog },
+      });
+      // The token does not expire on a schedule the way a minted one does, so
+      // it is remembered for the life of the process rather than pruned by
+      // validity — `redact` still has to find it in every log line and error.
+      this.remember(this.userToken, Number.POSITIVE_INFINITY);
+    } else {
+      this.userToken = null;
+      // Throws on a malformed PEM before any call is made, and the KeyObject
+      // is the only form of the key that is kept.
+      this.privateKey = createPrivateKey(config.privateKeyPem as string);
+      this.appOctokit = new Octokit({
+        ...common,
+        request: { fetch: this.authedFetch(async () => `Bearer ${await this.appJwt()}`), log: octokitLog },
+      });
+      this.octokit = new Octokit({
+        ...common,
+        request: {
+          fetch: this.authedFetch(async () => `token ${await this.installationToken()}`),
+          log: octokitLog,
+        },
+      });
+    }
   }
 
   /**
@@ -696,7 +771,7 @@ export class GitHubAdapter implements GitHubApi {
     const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = b64url(JSON.stringify({ iat: issuedAt, exp: expiresAtSec, iss: this.config.appId }));
     const signingInput = `${header}.${payload}`;
-    const signature = createSign('RSA-SHA256').update(signingInput).sign(this.privateKey);
+    const signature = createSign('RSA-SHA256').update(signingInput).sign(this.privateKey as KeyObject);
     const token = `${signingInput}.${b64url(signature)}`;
     this.jwtCache = { token, expiresAt: expiresAtSec * 1000 };
     this.remember(token, expiresAtSec * 1000);
@@ -724,7 +799,7 @@ export class GitHubAdapter implements GitHubApi {
     const id = await this.call(
       'resolveInstallationId',
       async () => {
-        const res = await this.appOctokit.request('GET /repos/{owner}/{repo}/installation', {
+        const res = await (this.appOctokit as Octokit).request('GET /repos/{owner}/{repo}/installation', {
           owner: repo.owner,
           repo: repo.name,
         });
@@ -756,7 +831,7 @@ export class GitHubAdapter implements GitHubApi {
     const minted = await this.call(
       'mintInstallationToken',
       async () => {
-        const res = await this.appOctokit.request('POST /app/installations/{installation_id}/access_tokens', {
+        const res = await (this.appOctokit as Octokit).request('POST /app/installations/{installation_id}/access_tokens', {
           installation_id: installationId,
         });
         const data = res.data as { token?: string; expires_at?: string };
@@ -834,8 +909,10 @@ export class GitHubAdapter implements GitHubApi {
 
         const failure = normalizeFailure(raw);
 
-        // A token that GitHub no longer accepts: mint once more, try once more.
-        if (failure.status === 401 && refreshAuth && !authRetried) {
+        // A token that GitHub no longer accepts: mint once more, try once
+        // more. Contributor mode's token cannot be re-minted — it is the one
+        // static secret in GITHUB_TOKEN_FILE — so a 401 there is terminal.
+        if (failure.status === 401 && refreshAuth && !authRetried && this.config.authMode === 'app') {
           authRetried = true;
           this.invalidateToken();
           this.log('warn', 'github rejected the installation token; re-minting', { operation });
@@ -1434,18 +1511,117 @@ export class GitHubAdapter implements GitHubApi {
     return rows.map((row) => mapPolledComment(row, numberFromUrl(row.pull_request_url)));
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Contributor-mode ingress: notifications
+  // ───────────────────────────────────────────────────────────────────────────
+
   /**
-   * The App's own identity. `GET /app` is JWT-authenticated and answers with
-   * the App's slug; the login that appears as a comment author is that slug
-   * with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds. Cached: an
-   * App does not rename itself mid-session.
+   * Submitted reviews newer than `since`: `GET pulls/{n}/reviews`, which the
+   * REST API gives no `since` filter for, so this method is the filter,
+   * bounded to {@link LIMITS.listEntries} and answered oldest-first like every
+   * other `…Since` method.
+   */
+  async listReviewsSince(pull: ThreadRef, since: string): Promise<PolledReview[]> {
+    const sinceMs = Date.parse(since);
+    return this.call('listReviewsSince', async () => {
+      const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
+        owner: pull.repo.owner,
+        repo: pull.repo.name,
+        pull_number: pull.number,
+        per_page: 100,
+      });
+      const rows = (res.data as ApiReview[]).filter((row) => {
+        const at = Date.parse(row.submitted_at ?? '');
+        return Number.isFinite(at) && (!Number.isFinite(sinceMs) || at > sinceMs);
+      });
+      rows.sort((a, b) => Date.parse(a.submitted_at ?? '') - Date.parse(b.submitted_at ?? ''));
+      return rows.slice(0, LIMITS.listEntries).map(mapPolledReview);
+    });
+  }
+
+  /**
+   * One page of `GET /notifications?participating=true`, conditional on
+   * `ifModifiedSince` (the value this method itself last answered in
+   * `lastModified`). A 304 is not failure — it is the cheap case the contract
+   * asks for — so it is caught here rather than let `attempt`'s retry loop (or
+   * a caller) see it as one; nothing else about `call`'s auth and rate-limit
+   * handling is skipped, because this still goes out over `this.octokit`.
+   */
+  async listNotifications(ifModifiedSince: string | null): Promise<NotificationsPage> {
+    try {
+      const res = await this.octokit.request('GET /notifications', {
+        participating: true,
+        per_page: 50,
+        headers: ifModifiedSince ? { 'if-modified-since': ifModifiedSince } : {},
+      });
+      const headers = res.headers as Record<string, string | undefined>;
+      return {
+        notifications: (res.data as ApiNotification[])
+          .map(mapNotification)
+          .filter((n): n is NotificationRow => n !== null),
+        notModified: false,
+        lastModified: headers['last-modified'] ?? null,
+        pollIntervalSeconds: numberOrNull(headers['x-poll-interval']),
+      };
+    } catch (raw) {
+      const authFailure = authFailureIn(raw);
+      if (authFailure) throw authFailure;
+      const failure = normalizeFailure(raw);
+      if (failure.status === 304) {
+        return {
+          notifications: [],
+          notModified: true,
+          lastModified: failure.headers['last-modified'] ?? ifModifiedSince ?? null,
+          pollIntervalSeconds: numberOrNull(failure.headers['x-poll-interval']),
+        };
+      }
+      throw new GitHubApiError(failure.status, this.redact(failure.message), 'listNotifications');
+    }
+  }
+
+  /**
+   * `PATCH /notifications/threads/{id}`: best-effort, behind a flag that
+   * defaults off — a failure here must never be the reason an already-emitted
+   * event is retried, so the poller logs and moves on rather than letting
+   * this throw reach it.
+   */
+  async markNotificationThreadRead(threadId: string): Promise<void> {
+    await this.call('markNotificationThreadRead', async () => {
+      await this.octokit.request('PATCH /notifications/threads/{thread_id}', {
+        thread_id: Number(threadId),
+      });
+    });
+  }
+
+  /**
+   * App mode: the App's own identity. `GET /app` is JWT-authenticated and
+   * answers with the App's slug; the login that appears as a comment author
+   * is that slug with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds.
+   *
+   * Contributor mode: the token's own identity, `GET /user` — a human
+   * account, so `isBot` is false even though GITHUB_BOT_LOGIN is set to it for
+   * from-self and mention detection.
+   *
+   * Cached either way: neither identity renames itself mid-session.
    */
   async getAuthenticatedBot(): Promise<BotIdentity> {
     if (this.botCache) return this.botCache;
+    if (this.config.authMode === 'token') {
+      const identity = await this.call('getAuthenticatedBot', async () => {
+        const res = await this.octokit.request('GET /user');
+        const data = res.data as { login?: string | null; id?: number } | null;
+        return { login: data?.login ?? '', id: data?.id ?? 0, isBot: false };
+      });
+      if (!identity.login) {
+        throw new GitHubApiError(0, 'GET /user answered without a login, so the token identity is unknown', 'getAuthenticatedBot');
+      }
+      this.botCache = identity;
+      return identity;
+    }
     const identity = await this.call(
       'getAuthenticatedBot',
       async () => {
-        const res = await this.appOctokit.request('GET /app');
+        const res = await (this.appOctokit as Octokit).request('GET /app');
         const data = res.data as { slug?: string | null; id?: number; name?: string | null } | null;
         const slug = data?.slug ?? data?.name ?? '';
         return { login: slug ? `${slug}[bot]` : '', id: data?.id ?? 0, isBot: true as const };
@@ -1607,6 +1783,65 @@ function mapPolledComment(row: ApiComment, number: number): PolledComment {
   if (row.path != null) polled.path = row.path;
   if (row.in_reply_to_id != null) polled.inReplyTo = row.in_reply_to_id;
   return polled;
+}
+
+function mapPolledReview(row: ApiReview): PolledReview {
+  const review: PolledReview = {
+    id: row.id ?? 0,
+    author: actorOf(row.user),
+    body: row.body ?? '',
+    state: reviewStateOf(row.state),
+    submittedAt: row.submitted_at ?? '',
+    html_url: row.html_url ?? '',
+  };
+  if (row.commit_id != null) review.commitId = row.commit_id;
+  return review;
+}
+
+/**
+ * `GET /notifications`'s `subject.type` → the contract's `ThreadKind`, or
+ * `null` for a subject this ingress has no event kinds for (`Discussion`,
+ * `Commit`, `Release`, `CheckSuite`, …) — dropped rather than guessed.
+ */
+function notificationKindOf(type: string | null | undefined): ThreadKind | null {
+  if (type === 'Issue') return 'issue';
+  if (type === 'PullRequest') return 'pull';
+  return null;
+}
+
+/**
+ * A notification row, mapped. `repository.full_name` is split the same way
+ * `repoFrom` (normalize.ts) splits a webhook's, and `subject.url` — the API
+ * url of the issue or pull request, `…/issues/7` or `…/pulls/7` — is read with
+ * the same regex `numberFromUrl` uses on a comment's. A row whose repository
+ * is unparseable or whose subject names no kind this ingress maps is dropped
+ * (null): there is nothing a poll pass could ask GitHub about.
+ */
+function mapNotification(row: ApiNotification): NotificationRow | null {
+  const full = row.repository?.full_name ?? '';
+  const [owner, name] =
+    full.includes('/') ? full.split('/', 2) : [row.repository?.owner?.login ?? '', row.repository?.name ?? ''];
+  if (!owner || !name) return null;
+  const kind = notificationKindOf(row.subject?.type);
+  const number = numberFromUrl(row.subject?.url);
+  if (!row.id || kind === null || number === 0) return null;
+  return {
+    id: row.id,
+    updatedAt: row.updated_at ?? '',
+    reason: row.reason ?? '',
+    unread: row.unread === true,
+    repo: { owner, name },
+    kind,
+    number,
+    title: row.subject?.title ?? '',
+  };
+}
+
+/** `X-Poll-Interval` (seconds) → a finite number, or null for anything else. */
+function numberOrNull(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**

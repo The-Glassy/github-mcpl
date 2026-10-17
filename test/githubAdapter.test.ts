@@ -1623,3 +1623,149 @@ test('retention is by validity, so a credential GitHub would refuse is not kept 
     'a long-expired token is not retained; expiry is what bounds the set',
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contributor mode (user token)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const USER_TOKEN = 'ghp_TESTCONTRIBUTORTOKEN_do_not_log';
+
+function tokenConfig(extra: Record<string, string | undefined> = {}): Config {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-token-'));
+  const file = join(dir, 'token');
+  writeFileSync(file, `${USER_TOKEN}\n`, { mode: 0o600 });
+  return readConfig({
+    GITHUB_TOKEN_FILE: file,
+    GITHUB_REPOS: 'anima-research/rayforce',
+    GITHUB_BOT_LOGIN: 'a-human',
+    ...extra,
+  });
+}
+
+async function tokenRig(routes: (fake: FakeGitHub) => void = () => {}): Promise<{ adapter: GitHubAdapter; fake: FakeGitHub; logs: string[] }> {
+  const fake = new FakeGitHub();
+  routes(fake);
+  await fake.start();
+  const logs: string[] = [];
+  const record = (level: string) => (message: string, fields?: Record<string, unknown>) => {
+    logs.push(`${level} ${message} ${fields ? JSON.stringify(fields) : ''}`);
+  };
+  const logger: Logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error') };
+  const adapter = new GitHubAdapter(tokenConfig(), { baseUrl: fake.baseUrl, logger });
+  after(() => fake.stop());
+  return { adapter, fake, logs };
+}
+
+test('contributor mode authenticates every call with the user token, not an installation token', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { body: ISSUE_PAYLOAD });
+  });
+  await r.adapter.getIssue(ISSUE);
+
+  const call = r.fake.for('GET /repos/anima-research/rayforce/issues/7')[0];
+  assert.equal(call.headers.authorization, `token ${USER_TOKEN}`);
+  // No App endpoint is ever touched: there is no installation to mint for.
+  assert.equal(r.fake.calls.some((c) => c.path.includes('/access_tokens') || c.path === '/app'), false);
+  assert.ok(!r.logs.join('\n').includes(USER_TOKEN), 'the token leaked into a log line');
+});
+
+test('contributor mode answers getAuthenticatedBot from GET /user, not GET /app', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
+  });
+  const identity = await r.adapter.getAuthenticatedBot();
+  assert.deepEqual(identity, { login: 'a-human', id: 4242, isBot: false });
+  assert.equal(r.fake.for('GET /user')[0].headers.authorization, `token ${USER_TOKEN}`);
+});
+
+test('contributor mode does not retry a 401: the token cannot be re-minted', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 401, body: { message: 'Bad credentials' } });
+  });
+  let calls = 0;
+  r.fake.on('GET /repos/anima-research/rayforce/issues/7', () => {
+    calls += 1;
+    return { status: 401, body: { message: 'Bad credentials' } };
+  });
+  await assert.rejects(() => r.adapter.getIssue(ISSUE), GitHubApiError);
+  assert.equal(calls, 1, 'App mode retries a 401 once; contributor mode has nothing to re-mint');
+});
+
+test('listReviewsSince answers only reviews submitted after the cursor, oldest first', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const r = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, {
+      body: [
+        { id: 2, user: { login: 'human-two' }, body: 'lgtm', state: 'APPROVED', submitted_at: '2026-10-03T00:00:00Z', html_url: 'https://x/2' },
+        { id: 1, user: { login: 'human-one' }, body: 'nit', state: 'COMMENTED', submitted_at: '2026-10-01T00:00:00Z', html_url: 'https://x/1' },
+        { id: 3, user: { login: 'human-three' }, body: 'no', state: 'CHANGES_REQUESTED', submitted_at: '2026-10-05T00:00:00Z', html_url: 'https://x/3' },
+      ],
+    });
+  });
+  const rows = await r.adapter.listReviewsSince(pull, '2026-10-02T00:00:00Z');
+  assert.deepEqual(rows.map((row) => row.id), [2, 3]);
+  assert.equal(rows[0].state, 'approved');
+});
+
+test('listNotifications sends If-Modified-Since and reports a 304 as notModified, not an error', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer => {
+      if (req.query.participating !== 'true') return { status: 400, body: { message: 'expected participating=true' } };
+      if (req.headers['if-modified-since'] === 'Wed, 15 Oct 2026 00:00:00 GMT') {
+        return { status: 304, headers: { 'last-modified': 'Wed, 15 Oct 2026 00:05:00 GMT' } };
+      }
+      return {
+        status: 200,
+        headers: { 'last-modified': 'Wed, 15 Oct 2026 00:00:00 GMT', 'x-poll-interval': '90' },
+        body: [],
+      };
+    });
+  });
+
+  const first = await r.adapter.listNotifications(null);
+  assert.equal(first.notModified, false);
+  assert.equal(first.lastModified, 'Wed, 15 Oct 2026 00:00:00 GMT');
+  assert.equal(first.pollIntervalSeconds, 90);
+
+  const second = await r.adapter.listNotifications('Wed, 15 Oct 2026 00:00:00 GMT');
+  assert.equal(second.notModified, true);
+  assert.deepEqual(second.notifications, []);
+  assert.equal(second.lastModified, 'Wed, 15 Oct 2026 00:05:00 GMT');
+});
+
+test('listNotifications maps a subject into a repo, kind and number, and drops what it cannot map', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', {
+      body: [
+        {
+          id: '1',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'mention',
+          unread: true,
+          subject: { type: 'Issue', url: 'https://api.github.com/repos/anima-research/rayforce/issues/7', title: 'A bug' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
+        {
+          id: '2',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'subscribed',
+          unread: true,
+          subject: { type: 'Discussion', url: null, title: 'off-topic' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
+      ],
+    });
+  });
+  const page = await r.adapter.listNotifications(null);
+  assert.equal(page.notifications.length, 1);
+  assert.deepEqual(page.notifications[0], {
+    id: '1',
+    updatedAt: '2026-10-15T00:00:00Z',
+    reason: 'mention',
+    unread: true,
+    repo: { owner: 'anima-research', name: 'rayforce' },
+    kind: 'issue',
+    number: 7,
+    title: 'A bug',
+  });
+});
