@@ -183,7 +183,7 @@ const push: GateEventInfo = {
 
 // ─── what both recipes must do ───────────────────────────────────────────────
 
-for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json']) {
+for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json', 'recipe-contributor-token.json']) {
   test(`${name}: a green build on the agent's own thread does not wake it`, { skip: gatePath ? false : skipReason }, async () => {
     const d = (await gateFor(name)).probe(ownThreadCiSuccess);
     assert.equal(d.trigger, false, `woke via ${d.policyName}`);

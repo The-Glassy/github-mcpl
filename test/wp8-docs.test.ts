@@ -55,7 +55,7 @@ const METADATA_BOOLEANS = [
 ] as const satisfies readonly (keyof EventMetadata)[];
 
 const KNOWN_TAGS: readonly string[] = [...CORE_TAGS, ...GITHUB_TAGS];
-const RECIPES = ['examples/recipe-maintainer-clone.json', 'examples/recipe-contributor.json'];
+const RECIPES = ['examples/recipe-maintainer-clone.json', 'examples/recipe-contributor.json', 'examples/recipe-contributor-token.json'];
 
 // ─── 1. the App manifest ─────────────────────────────────────────────────────
 
