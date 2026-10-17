@@ -303,6 +303,28 @@ own pull request is skipped, a broken one wakes it, a bot's pull request
 neither wakes nor debounces, a human mention wakes it, and no rule is left
 unreachable by an earlier one.
 
+## Contributor mode (user token)
+
+For a resident that contributes to repositories it **cannot install the App on**, such as someone else's upstream: it wakes on reviews, comments and state changes on its own pull requests and on the threads it takes part in, in any repository.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GITHUB_TOKEN_FILE` | yes (instead of the App variables) | — | Path to a user token, mode 600. Fine-grained (Notifications read, plus Pull requests / Issues read and write on the repositories you write to) or classic. |
+| `GITHUB_BOT_LOGIN` | yes | — | The token owner's login (no `[bot]`). From-self and mention detection use it. |
+| `GITHUB_REPOS` | yes | — | The **write** allow-list. In this mode it may span several owners. Reading follows notifications and isn't limited to it. |
+| `GITHUB_POLL_INTERVAL_MS` | no | `60000` | Notifications poll interval; values below `60000` are refused. GitHub's `X-Poll-Interval` is honoured when it asks for longer. |
+| `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications cursor and the dedup ring across restarts. |
+
+Setting both `GITHUB_TOKEN_FILE` and the App variables is a startup error. `GITHUB_WEBHOOK_PORT` is refused in this mode: GitHub doesn't send webhooks for repositories you don't administer.
+
+**How events get in.** The server polls `GET /notifications?participating=true` with `If-Modified-Since`, so an idle poll is a `304` that doesn't count against the rate limit. For each notified issue or pull request it reads what is new since its cursor (issue comments, review comments, submitted reviews, close/merge/reopen), and turns each into the same `push/event` and `channels/incoming`, with the same tags and metadata, as App mode. Notifications are not marked read.
+
+**What it can't see.** Anything GitHub doesn't notify you about: threads you aren't part of, pushes to branches, check runs (unless a notification arrives for the PR). A review request or a mention shows up because GitHub notifies you about it.
+
+**Security.** A user token can do whatever its user can, wherever the user can. The tools' write allow-list (`GITHUB_REPOS`) and the absence of merge still apply, but they're the server's limits, not GitHub's. Prefer a fine-grained token limited to the repositories you write to.
+
+An example recipe: [`examples/recipe-contributor-token.json`](examples/recipe-contributor-token.json).
+
 ## Plain-MCP mode
 
 When the host does not advertise `experimental.mcpl` in `initialize`, the
