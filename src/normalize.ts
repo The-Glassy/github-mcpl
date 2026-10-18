@@ -612,16 +612,20 @@ export function normalizePolledComment(
  * poller only — the repository poll has no equivalent, since `since` on this
  * endpoint is a client-side filter the adapter applies itself). Same shape as
  * the webhook's `pull_request_review` case in {@link normalizeWebhook}: one
- * `review.submitted` event, so a notification and a webhook delivery of the
- * same review tag and render identically.
+ * `review.submitted` event with the pull request's title, and the commit the
+ * review was written against, falling back to the pull request's head where
+ * the row has none, so a notification and a webhook delivery of the same
+ * review tag and render alike.
  */
 export function normalizePolledReview(
   repo: RepoRef,
   pull: ThreadRef,
   row: PolledReview,
   receivedAt: string,
+  pullRow: { title: string; headSha?: string },
 ): NormalizedEvent {
   const key = pollKey('review', row.id, row.submittedAt);
+  const sha = row.commitId ?? pullRow.headSha;
   return {
     id: pollEventId(key),
     receivedAt,
@@ -629,9 +633,10 @@ export function normalizePolledReview(
     kind: 'review.submitted',
     thread: pull,
     actor: row.author,
+    title: pullRow.title,
     body: row.body,
     html_url: row.html_url,
-    ...(row.commitId === undefined ? {} : { sha: row.commitId }),
+    ...(sha === undefined ? {} : { sha }),
     review: { id: row.id, state: row.state },
     raw: row,
   };

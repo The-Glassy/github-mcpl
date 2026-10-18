@@ -37,6 +37,15 @@ export function repoSlug(repo: RepoRef): string {
   return `${repo.owner}/${repo.name}`;
 }
 
+/** An ISO 8601 instant in UTC as GitHub and this server write them, `2026-10-15T00:09:30Z`, with or without fractional seconds. */
+export function isIsoInstant(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
 /** Parse `owner/name`. Returns null for anything else (no guessing). */
 export function parseRepoSlug(slug: string): RepoRef | null {
   const m = /^([^/\s]+)\/([^/\s]+)$/.exec(slug.trim());
@@ -83,7 +92,8 @@ export type NormalizedEventKind =
   | 'review_comment.created'
   | 'review_comment.edited'
   | 'checks.completed'
-  | 'push';
+  | 'push'
+  | 'thread.read_failed';
 
 export const NORMALIZED_EVENT_KINDS: readonly NormalizedEventKind[] = [
   'issue.opened',
@@ -103,6 +113,7 @@ export const NORMALIZED_EVENT_KINDS: readonly NormalizedEventKind[] = [
   'review_comment.edited',
   'checks.completed',
   'push',
+  'thread.read_failed',
 ] as const;
 
 export type ReviewState = 'approved' | 'changes_requested' | 'commented';
@@ -286,6 +297,12 @@ export interface IssueSearchHit {
   html_url: string;
 }
 
+/** A search inside one repository: its hits, and how many results GitHub gave from other repositories, left out. */
+export interface IssueSearch {
+  hits: IssueSearchHit[];
+  outside: number;
+}
+
 export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES';
 
 export interface ReviewCommentInput {
@@ -366,6 +383,12 @@ export interface PolledIssue {
    * this, not the author: the bot's own close must come back as from-self.
    */
   closedBy?: EventActor;
+  /**
+   * When it was last closed, from `closed_at`. Contributor mode's
+   * notifications poller reads it for a thread it has no marker for: a close
+   * before the watermark is old news, one after it is an event.
+   */
+  closedAt?: string;
 }
 
 /**
@@ -421,7 +444,7 @@ export interface GitHubApi {
   listReviewThreads(pull: ThreadRef): Promise<ReviewThread[]>;
   listPullRequestFiles(pull: ThreadRef): Promise<PullRequestFile[]>;
   getCheckRuns(repo: RepoRef, sha: string): Promise<ChecksSummary>;
-  searchIssues(repo: RepoRef, query: string, limit?: number): Promise<IssueSearchHit[]>;
+  searchIssues(repo: RepoRef, query: string, limit?: number): Promise<IssueSearch>;
 
   // ── Comments ──
   createComment(thread: ThreadRef, body: string): Promise<Comment>;
@@ -759,6 +782,7 @@ export const GITHUB_TAGS = [
   'github:ci=success',
   'github:ci=failure',
   'github:push',
+  'github:read-failed',
   'github:actor=maintainer',
 ] as const;
 
@@ -871,7 +895,47 @@ export interface StateSnapshot {
    * recorded here; bounded by {@link POLL_HEAD_MEMORY}.
    */
   pollHeads: Record<string, string>;
+  /**
+   * Contributor mode's notifications watermark: `since`, the instant (ISO) the
+   * notifications list is read from; `lastModified`, the HTTP-date the last
+   * full listing answered, sent back as `If-Modified-Since`; and `answeredAt`,
+   * when GitHub last answered a listing (ISO), a 304 included, where a thread
+   * read for the first time reaches back from. A field of
+   * its own, so a state file kept across a switch of modes never hands App
+   * mode's `lastPollAt` an HTTP-date, or this an ISO instant. A state file
+   * written before it has none: no watermark yet. `retry` is the threads the
+   * poller still owes a read ({@link NotificationRetry}); dropping it would
+   * lose what their failed reads held back.
+   */
+  notifications: NotificationsWatermark & { retry: NotificationRetry[] };
 }
+
+/** {@link StateSnapshot.notifications}: where the next listing starts, and what it sends. */
+export interface NotificationsWatermark {
+  since: string | null;
+  lastModified: string | null;
+  answeredAt: string | null;
+}
+
+/**
+ * A notified thread whose last read or delivery failed, or that GitHub's rate
+ * limit kept from being read: the notifications poller reads it again on each
+ * pass whose listing gets through, listed or not, until it gets through or has
+ * failed {@link NOTIFICATION_RETRY_LIMIT} passes in a row.
+ */
+export interface NotificationRetry {
+  owner: string;
+  name: string;
+  number: number;
+  kind: ThreadKind;
+  /** Passes it has failed in a row. */
+  attempts: number;
+  /** Its cursor as the head memory holds it, kept here too so eviction there can't lose its place while it waits. */
+  cursor?: string;
+}
+
+/** How many passes in a row a notified thread may fail before the poller drops it, naming it and the cause. */
+export const NOTIFICATION_RETRY_LIMIT = 5;
 
 /** How many poll keys the dedup ring remembers. */
 export const POLL_DEDUP_RING = 2000;
@@ -906,6 +970,12 @@ export interface StateStore {
   checkpointStatus(checkpointId: string): CheckpointStatus;
   lastPollAt(): string | null;
   setLastPollAt(when: string): void;
+  /** Contributor mode's notifications watermark ({@link StateSnapshot.notifications}). */
+  notificationsWatermark(): NotificationsWatermark;
+  setNotificationsWatermark(watermark: { since: string; lastModified: string | null; answeredAt: string | null }): void;
+  /** Contributor mode's threads to read again ({@link NotificationRetry}). */
+  notificationRetries(): NotificationRetry[];
+  setNotificationRetries(retries: NotificationRetry[]): void;
   /** True when the key was already seen; otherwise records it in the ring and returns false. */
   seenPollKey(key: string): boolean;
   /**
@@ -1128,7 +1198,13 @@ export function readConfig(env: Env = process.env): Config {
   let userToken: string | null = null;
 
   if (authMode === 'token') {
-    userToken = readSecretFile('GITHUB_TOKEN_FILE', tokenFileRaw, problems);
+    // A token holds no whitespace, so whitespace or a byte-order mark an
+    // editor left before it goes too. readSecretFile itself keeps leading
+    // bytes, since a webhook secret may begin with a space.
+    userToken = readSecretFile('GITHUB_TOKEN_FILE', tokenFileRaw, problems)?.replace(/^[\uFEFF\s]+/, '') ?? null;
+    if (env.GITHUB_APP_INSTALLATION_ID?.trim()) {
+      problems.push('GITHUB_APP_INSTALLATION_ID: App mode only; contributor mode (GITHUB_TOKEN_FILE) has no installation, so unset it');
+    }
   } else {
     if (!appIdRaw) problems.push('GITHUB_APP_ID: required (or set GITHUB_TOKEN_FILE for contributor mode)');
     else if (!/^\d+$/.test(appIdRaw)) problems.push(`GITHUB_APP_ID: must be the numeric App id, got "${appIdRaw}"`);

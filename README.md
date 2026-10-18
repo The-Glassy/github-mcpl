@@ -305,23 +305,33 @@ unreachable by an earlier one.
 
 ## Contributor mode (user token)
 
-For a resident that contributes to repositories it **cannot install the App on**, such as someone else's upstream: it wakes on reviews, comments and state changes on its own pull requests and on the threads it takes part in, in any repository.
+For a resident that contributes to repositories it **cannot install the App on**, such as someone else's upstream: it wakes on reviews, comments and state changes on its own pull requests and on the threads it takes part in.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GITHUB_TOKEN_FILE` | yes (instead of the App variables) | — | Path to a user token, mode 600. Fine-grained (Notifications read, plus Pull requests / Issues read and write on the repositories you write to) or classic. |
-| `GITHUB_BOT_LOGIN` | yes | — | The token owner's login (no `[bot]`). From-self and mention detection use it. |
-| `GITHUB_REPOS` | yes | — | The **write** allow-list. In this mode it may span several owners. Reading follows notifications and isn't limited to it. |
+| `GITHUB_TOKEN_FILE` | yes (instead of the App variables) | — | Path to a personal access token (classic), mode 600. See **The token** below. |
+| `GITHUB_BOT_LOGIN` | yes | — | The token owner's login, spelled as GitHub spells it (no `[bot]`). From-self and mention detection use it. At start, when GitHub answers, the server checks it against the token's own login and stops if they differ; when GitHub doesn't answer, it starts unchecked and logs a warning. |
+| `GITHUB_REPOS` | yes | — | The repositories the agent works in, and the write allow-list. In this mode it may span several owners. Notifications from any other repository are dropped. Spell each as GitHub does: at start the server checks each against GitHub and stops on a different spelling, or a repository the token can't see. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `60000` | Notifications poll interval; values below `60000` are refused. GitHub's `X-Poll-Interval` is honoured when it asks for longer. |
-| `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications cursor and the dedup ring across restarts. |
+| `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications watermark, when GitHub last answered, each thread's cursor, the threads to read again and the dedup ring across restarts. Without it, every start begins as a first start does (below): activity from a longer downtime isn't delivered, and some from before the start can arrive twice. |
 
-Setting both `GITHUB_TOKEN_FILE` and the App variables is a startup error. `GITHUB_WEBHOOK_PORT` is refused in this mode: GitHub doesn't send webhooks for repositories you don't administer.
+Setting both `GITHUB_TOKEN_FILE` and the App variables is a startup error, and so is `GITHUB_APP_INSTALLATION_ID`. `GITHUB_WEBHOOK_PORT` is refused in this mode: GitHub doesn't send webhooks for repositories you don't administer.
 
-**How events get in.** The server polls `GET /notifications?participating=true` with `If-Modified-Since`, so an idle poll is a `304` that doesn't count against the rate limit. For each notified issue or pull request it reads what is new since its cursor (issue comments, review comments, submitted reviews, close/merge/reopen), and turns each into the same `push/event` and `channels/incoming`, with the same tags and metadata, as App mode. Notifications are not marked read.
+**The token.** GitHub serves the notifications endpoints to a personal access token (classic) only; a fine-grained token can't read them. Give it the narrowest scopes that work: `notifications`, plus `public_repo` when the repositories are public. `repo` is full read and write access to every private repository the account can reach, so use it only when a private repository needs it.
 
-**What it can't see.** Anything GitHub doesn't notify you about: threads you aren't part of, pushes to branches, check runs (unless a notification arrives for the PR). A review request or a mention shows up because GitHub notifies you about it.
+**The account.** Use an account the agent alone posts from, such as a machine account. GitHub shows the agent's comments, reviews and pull requests as that account's, and this server treats everything that account does as the agent's own: its own events are tagged from-self and don't wake it, and the comment tools let it edit and delete that account's comments.
 
-**Security.** A user token can do whatever its user can, wherever the user can. The tools' write allow-list (`GITHUB_REPOS`) and the absence of merge still apply, but they're the server's limits, not GitHub's. Prefer a fine-grained token limited to the repositories you write to.
+**How events get in.** The server lists `GET /notifications?all=true&participating=true&since=…` from where the last listing got to, with `If-Modified-Since`, so an idle poll is a `304` that doesn't count against the rate limit. Read and unread threads are listed alike, and nothing is marked read. For each listed issue or pull request in `GITHUB_REPOS`, it reads what is new since its last read: comments, a pull request's review comments and submitted reviews, and its state. Each becomes the same `push/event` and `channels/incoming`, with the same tags and metadata, as in App mode. A thread opened since the last pass arrives as opened, a close or merge as closed, with whoever closed or merged it as the actor, and an edit as edited; a thread opened and closed between two passes arrives as closed. An edit to a closed issue or pull request arrives as nothing. As with App mode's repository poll, a reopened issue arrives as edited, and a reopened pull request as `pull.synchronize`. The tools' `search_issues` searches one repository in `GITHUB_REPOS`: it drops `repo:`, `user:`, `org:` and `owner:` qualifiers from the query, and leaves out, and counts, any result on the page from another repository.
+
+**What a pass costs.** The listing, one request a page of 50 threads, and nothing more when it's a `304` and no thread waits on the retry list (below). Then, for each thread it lists or that waits, two requests for an issue (its row and its comments) and up to five for a pull request (its row, its head while it's open, its comments, its review comments and its reviews), each list taking more when it runs past a page. The agent's own tool calls draw on the same 5,000 an hour.
+
+**When a thread can't be read.** A thread whose read fails, or one of whose events the host refuses, waits on a retry list that keeps its place, and is read first on each later pass whose listing gets through, for up to five passes in a row. Then the server stops trying, and delivers one `thread.read_failed` event on that thread's channel, naming the cause, tagged `chat:mention` since the server addresses it to the agent; a thread gone or out of the token's reach gets that at once. It reads the thread again, from where it left off, when the thread next moves on GitHub, while its place is among the last 200 threads read. GitHub's rate limit counts no pass against a thread: it ends the pass's reads, and the rest wait for the next pass. A thread with more comments and reviews to read at once than one read takes (2,000; a pull request's reviews count whole, since GitHub's reviews list takes no `since`) is read from its latest update on, and its `thread.read_failed` event says its backlog was skipped. A listing that runs past 20 pages (1,000 threads) delivers what it listed and logs the window it may have missed.
+
+**Where delivery begins.** A first start, with no watermark stored, lists what GitHub notified from one poll interval before the start, as App mode's repository poll begins, and logs that instant to stderr. GitHub writes a notification some seconds after the activity it reports (about 20 s on one account in October 2026). So a thread read for the first time is read from five minutes before GitHub's previous answer to a listing, or, at a first start, five minutes before that instant. Activity from those five minutes arrives; anything older on that thread doesn't.
+
+**What it can't see.** Anything GitHub doesn't notify you about: threads you aren't part of, pushes to branches, check runs (unless a notification arrives for the pull request). A review request or a mention shows up because GitHub notifies you about it.
+
+**Security.** A user token can do whatever its user can, wherever the user can. The tools' allow-list (`GITHUB_REPOS`) and the absence of merge still apply, but they're the server's limits, not GitHub's.
 
 An example recipe: [`examples/recipe-contributor-token.json`](examples/recipe-contributor-token.json).
 
@@ -402,6 +412,7 @@ contract and is listed here in full.
 | `github:review-comment` | an inline comment on a diff |
 | `github:ci=` | `success`, `failure` |
 | `github:push` | a push with no thread attached |
+| `github:read-failed` | contributor mode stopped reading a thread until it next moves, or skipped its backlog; the event also carries `chat:mention`, since the server addresses it to the agent |
 | `github:actor=maintainer` | the actor is in `GITHUB_MAINTAINERS` |
 
 **Metadata.** Booleans first — these are what `metadataTrue` matches:

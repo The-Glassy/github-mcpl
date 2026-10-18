@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { tagsFor } from '../src/tags.js';
 
 const packageDir = fileURLToPath(new URL('..', import.meta.url));
 
@@ -181,6 +182,28 @@ const push: GateEventInfo = {
   metadata: { isOwnThread: false, fromSelf: false, repo: 'owner/repo' },
 };
 
+/**
+ * Contributor mode's notice that the poller stopped reading a thread, tagged
+ * by tags.ts itself, on a thread the agent never spoke in: the case where a
+ * missed mention is all the agent would otherwise lose.
+ */
+const readFailedNotice: GateEventInfo = (() => {
+  const { tags, metadata } = tagsFor(
+    {
+      id: 'poll:read_failed:github:owner/repo#12:2026-10-15T00:10:00.000Z',
+      receivedAt: '2026-10-15T00:10:00.000Z',
+      repo: { owner: 'owner', name: 'repo' },
+      kind: 'thread.read_failed',
+      thread: { repo: { owner: 'owner', name: 'repo' }, number: 12, kind: 'issue' },
+      actor: { login: 'github-mcpl', isBot: true },
+      html_url: 'https://github.com/owner/repo/issues/12',
+      body: "github-mcpl stopped reading this thread's new activity: GitHub answered 404: Not Found, so the thread is gone or out of this token's reach.",
+    },
+    { botLogin: 'rayforce-clone', maintainers: [], isOwnThread: false },
+  );
+  return { ...base, eventType: 'mcpl:channel-incoming', content: 'github-mcpl stopped reading this thread', tags, metadata: { ...metadata } };
+})();
+
 // ─── what both recipes must do ───────────────────────────────────────────────
 
 for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json', 'recipe-contributor-token.json']) {
@@ -219,6 +242,12 @@ for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json', '
     const d = (await gateFor(name)).probe(push);
     assert.equal(d.trigger, false);
     assert.equal(d.policyName, 'github-machine-noise');
+  });
+
+  test(`${name}: the server's notice that it stopped reading a thread wakes it, on a thread it never spoke in`, { skip: gatePath ? false : skipReason }, async () => {
+    const d = (await gateFor(name)).probe(readFailedNotice);
+    assert.equal(d.trigger, true, `skipped via ${d.policyName}`);
+    assert.equal(d.policyName, 'github-direct-address');
   });
 
   test(`${name}: no rule is unreachable`, { skip: gatePath ? false : skipReason }, async () => {

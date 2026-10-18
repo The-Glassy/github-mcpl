@@ -4,199 +4,293 @@
  * App mode's two ingress paths — the webhook and the repository poll
  * (poller.ts) — both need an installation token's repository-scoped reads.
  * A user token has no installation and no webhook to receive, but it can read
- * `GET /notifications?participating=true`: every thread the token's own user
- * is participating in, across every repository they can reach, not only
- * GITHUB_REPOS. That is this module's ingress, and it is the only one
- * contributor mode runs (readConfig refuses GITHUB_WEBHOOK_PORT in this mode).
+ * `GET /notifications`: the threads its own user takes part in. That is this
+ * module's ingress, and it is the only one contributor mode runs (readConfig
+ * refuses GITHUB_WEBHOOK_PORT in this mode).
  *
- * The endpoint itself is cheap to poll: `If-Modified-Since` / `Last-Modified`
- * make an unchanged inbox a 304 (`NotificationsPage.notModified`, no body),
- * and a `X-Poll-Interval` response header can only raise the floor this
- * poller already holds it to ({@link MIN_POLL_INTERVAL_MS}), exactly like the
- * repository poll's `observePollInterval`.
+ * **What a pass lists.** The watermark W is where the last listing got to. A
+ * pass lists `GET /notifications?all=true&participating=true&since=W`, every
+ * page, conditional on the last listing's `Last-Modified`, so an unchanged
+ * inbox is a 304 that costs no rate limit. `all=true` lists read threads too,
+ * so nothing depends on what anyone has marked read, and this ingress marks
+ * nothing read. Threads in a repository outside GITHUB_REPOS are dropped: no
+ * tool and no `channels/publish` would act there, and a user's other threads
+ * would only reach the agent's context for nothing. W moves on with every
+ * listing that got through, whatever became of the threads it listed.
  *
- * What is expensive is the notification list itself: it says only *that* a
- * thread changed, never *what*, so for every thread with a subject this
- * ingress maps (`Issue` or `PullRequest`; anything else — a commit, a
- * discussion, a release — is dropped) this poller re-reads that one thread:
- * its comments since the thread's own cursor ({@link GitHubApi.listComments}),
- * a pull request's review comments and submitted reviews since the same
- * cursor, and whether its state changed. Every one of those is normalized by
- * the *same* pure functions App mode's poll and webhook ingress use
- * (normalize.ts's `normalizePolledComment` and the new `normalizePolledReview`),
- * so a comment or a review reaching the model this way carries the same tags,
- * metadata and channel as it would under a webhook or a repository poll — the
- * difference is only which GitHub endpoint noticed it.
+ * **What it reads of a thread.** Each listed thread, and each thread a past
+ * pass failed on, is read since its own cursor, every page: its conversation
+ * comments, and for a pull request its review comments and its reviews. Its
+ * row from the issues endpoint, read first, says what changed of its state,
+ * through the same `normalizePolledIssue` App mode's repository poll uses.
+ * Every GitHub event comes from normalize.ts's functions, so it carries the
+ * tags, metadata and channel the repository poll's would; the poller's own
+ * `thread.read_failed` notice is built here.
  *
- * Durable state is the existing {@link StateStore} seam (state.ts), reused
- * rather than widened:
+ * **A thread with no cursor** reads its rows from {@link NOTIFICATION_DELAY_MS}
+ * before GitHub's previous answer to a listing, 304s included (before W, when
+ * GitHub hasn't answered yet). A new thread wasn't in that answer, so what's
+ * new on it came after it, less the time GitHub takes to write a notification
+ * and stamp the thread's `updated_at` in the listing (about 20 s on the
+ * house's account in October 2026). A thread whose cursor the bounded head
+ * memory evicted, or one only now in GITHUB_REPOS, reads from there too, and
+ * can miss what came before. Its opening is an event if it opened since then,
+ * and its close if it closed since then. Anything else its state
+ * says is taken as known, so an evicted thread can miss a state change other
+ * than an opening or a close. It misses none of its rows unless it was dropped
+ * (below) with rows held back, and its place was evicted before it moved.
  *
- *   - `lastPollAt`/`setLastPollAt` hold the notifications endpoint's own
- *     `Last-Modified`, not an ISO instant — App mode and contributor mode
- *     never run in the same process, so the field's meaning never has to be
- *     disambiguated at the call site.
- *   - `seenPollKey` is the same dedup ring the repository poll uses. A key is
- *     always `event.id` (`poll:<kind>:<github-id>:<timestamp>`), which is
- *     stable across a restart because every component of it — the kind, the
- *     id GitHub itself assigned, and the row's own timestamp — is.
- *   - `polledHead`/`setPolledHead` hold one packed string per thread channel:
- *     the content cursor ("new since here") and the state marker ("what the
- *     thread looked like last"), so no new per-thread map is needed either.
+ * **Durable state** (state.ts), flushed after each thread and each listing:
+ *   - W and the last `Last-Modified`, in a field of their own
+ *     (`notificationsWatermark`), apart from App mode's `lastPollAt`, and the
+ *     threads to read again (`notificationRetries`);
+ *   - each thread's cursor, in the head memory under `notif:<channel>`: where
+ *     its next reads start (the thread's `updated_at` as last read), the
+ *     `updated_at` whose state was last delivered, and that state's marker;
+ *   - the dedup ring, keyed `<kind>:<id>:<timestamp>` as the repository poll
+ *     keys it, so a row a pass reads twice is delivered once.
  *
- * Nothing is marked read on GitHub unless `markRead` is set (default off, the
- * task's "optional, behind a flag defaulting off"), and even then only after
- * every one of a thread's events delivered without throwing — the same
- * "commit only after delivery" discipline poller.ts documents, so a crash or
- * a refused delivery is retried instead of silently dropped because the
- * notification had already been marked read.
+ * **Failures.** A thread's cursor moves past rows only once each was
+ * delivered, and past a state change only once it was. A thread whose read or
+ * delivery failed goes on the retry list, which keeps its cursor too, and is
+ * read again first on each later pass whose listing gets through, listed or
+ * not, until it gets through or has failed {@link NOTIFICATION_RETRY_LIMIT}
+ * passes in a row. Then it's dropped, with one `thread.read_failed` event on
+ * its channel saying why, and read again when it next moves, from its cursor
+ * while that is among the last 200 the head memory keeps. A thread gone or
+ * out of the token's reach is dropped at once. GitHub's rate limit counts no
+ * pass against a thread: it ends the pass's reads, the threads not yet read
+ * wait on the retry list for the next pass, and the thread that met it goes
+ * to the back of the list. A thread with more new activity than one read
+ * takes is read from its current update on, and its event says so.
  */
 
-import { createHash } from 'node:crypto';
-import { normalizePolledComment, normalizePolledReview } from './normalize.js';
+import {
+  normalizePolledComment,
+  normalizePolledIssue,
+  normalizePolledReview,
+  polledMarker,
+} from './normalize.js';
 import {
   MIN_POLL_INTERVAL_MS,
+  NOTIFICATION_RETRY_LIMIT,
   channelId,
+  isIsoInstant,
+  repoAllowed,
   silentLogger,
-  type Comment,
-  type Issue,
+  type EventActor,
   type Logger,
   type NormalizedEvent,
-  type NormalizedEventKind,
+  type NotificationRetry,
+  type NotificationsWatermark,
   type PolledComment,
+  type PolledIssue,
   type PolledReview,
-  type PullRequest,
   type RepoRef,
-  type ThreadKind,
   type ThreadRef,
 } from './types.js';
 import type { EventListener } from './webhook.js';
-import type { NotificationRow, NotificationsPage } from './github-adapter.js';
+import { ReadCapError, describeFailure, isLastingFailure, isRateLimit, type NotificationsPage } from './github-adapter.js';
 
 /** The adapter surface this ingress uses. A structural subset — `GitHubAdapter` satisfies it with no cast. */
 export interface NotificationsPollerApi {
-  listNotifications(ifModifiedSince: string | null): Promise<NotificationsPage>;
-  listComments(thread: ThreadRef, since?: string): Promise<Comment[]>;
-  listReviewCommentsSince(repo: RepoRef, since: string): Promise<PolledComment[]>;
+  listNotifications(opts: { since: string; ifModifiedSince: string | null }): Promise<NotificationsPage>;
+  getPolledThread(thread: ThreadRef): Promise<PolledIssue>;
+  listCommentsSince(thread: ThreadRef, since: string): Promise<PolledComment[]>;
+  listPullReviewCommentsSince(pull: ThreadRef, since: string): Promise<PolledComment[]>;
   listReviewsSince(pull: ThreadRef, since: string): Promise<PolledReview[]>;
-  getIssue(ref: ThreadRef): Promise<Issue>;
-  getPullRequest(ref: ThreadRef): Promise<PullRequest>;
-  markNotificationThreadRead(threadId: string): Promise<void>;
 }
 
-/**
- * The durable state this ingress needs: the same shape poller.ts's
- * `IngressState` declares (structurally identical to `StateStore`'s own
- * subset), so `state.ts`'s `GithubState` satisfies this with no adapter.
- */
+/** The durable state this ingress needs; `state.ts`'s `GithubState` satisfies it with no adapter. */
 export interface NotificationsIngressState {
-  lastPollAt(): string | null;
-  setLastPollAt(when: string): void;
+  notificationsWatermark(): NotificationsWatermark;
+  setNotificationsWatermark(watermark: { since: string; lastModified: string | null; answeredAt: string | null }): void;
+  notificationRetries(): NotificationRetry[];
+  setNotificationRetries(retries: NotificationRetry[]): void;
   seenPollKey(key: string): boolean;
   polledHead(channel: string): string | null;
   setPolledHead(channel: string, value: string): void;
   snapshot(): { pollKeys: string[] };
+  flush(): Promise<void>;
 }
 
 export interface NotificationsPollerOptions {
   api: NotificationsPollerApi;
   state: NotificationsIngressState;
-  /** GITHUB_POLL_INTERVAL_MS. readConfig floors and defaults this in contributor mode, so it is never 0 in practice. */
+  /** GITHUB_POLL_INTERVAL_MS. readConfig refuses a value below the floor and defaults an unset one in contributor mode, so it is never 0 in practice. */
   intervalMs: number;
+  /** GITHUB_REPOS. A notification from any other repository is dropped. */
+  repos: readonly RepoRef[];
   onEvent: EventListener;
   logger?: Logger;
   /** Overridable in tests. */
   now?: () => Date;
-  /** GITHUB_MARK_NOTIFICATIONS_READ. Default off. */
-  markRead?: boolean;
 }
 
 /** What one pass did, for diagnostics and for the tests. */
 export interface NotificationsPollResult {
-  /** True on a 304: nothing else in this result is populated. */
+  /** True on a 304. Threads on the retry list are read all the same. */
   notModified: boolean;
-  /** Threads with a mapped subject this pass looked at. */
+  /** Threads read: those listed in GITHUB_REPOS, and those on the retry list. */
   threads: number;
+  /** Issue and pull-request threads listed outside GITHUB_REPOS, dropped. */
+  outOfScope: number;
   delivered: NormalizedEvent[];
   duplicates: number;
-  /** Deliveries (or a whole thread's lookup) that threw; retried next pass. */
+  /** Threads whose read or deliveries failed this pass. */
   failed: number;
+  /** Threads dropped from the retry list this pass. */
+  dropped: number;
+  /** True when the listing stopped at its page cap, so some threads updated since W weren't listed. */
+  truncated: boolean;
 }
 
-/** One packed `polledHead` value: the per-thread content cursor and state marker. */
+/**
+ * How long before GitHub's previous answer a thread with no cursor starts its reads. GitHub stamps a
+ * notification when it writes it: in a read of the house's account on
+ * 2026-10-18, the listing's stamp came 20 to 26 s after the thread's own
+ * update in 11 of 14 threads, and 0 to 2 s after it in the rest. So the
+ * activity behind a thread first listed now can be older than the answer
+ * before it. Five minutes leaves room for a slower day; what it reads again
+ * is dropped by the dedup ring.
+ */
+export const NOTIFICATION_DELAY_MS = 5 * 60_000;
+
+/** A thread's cursor, packed into one head-memory value. */
+interface ThreadCursor {
+  /** Where the thread's next reads start: its `updated_at` when last read whole. */
+  since: string | null;
+  /** The thread `updated_at` whose state was last delivered: null for a thread never read. */
+  seen: string | null;
+  /** The state marker last delivered (normalize.ts's `polledMarker`). */
+  marker: string | undefined;
+}
+
 const CURSOR_SEP = '\u0000';
+const NO_CURSOR: ThreadCursor = { since: null, seen: null, marker: undefined };
 
-function packCursor(since: string, marker: string): string {
-  return `${since}${CURSOR_SEP}${marker}`;
+function packCursor(cursor: ThreadCursor): string {
+  return [cursor.since ?? '', cursor.seen ?? '', cursor.marker ?? ''].join(CURSOR_SEP);
 }
 
-function unpackCursor(value: string | null): { since: string | null; marker: string | undefined } {
-  if (value === null) return { since: null, marker: undefined };
-  const at = value.indexOf(CURSOR_SEP);
-  if (at < 0) return { since: value, marker: undefined };
-  const marker = value.slice(at + 1);
-  return { since: value.slice(0, at), marker: marker === '' ? undefined : marker };
+/** A cursor this module wrote, or none: a value of another shape, or whose times aren't instants, names nothing here. */
+function unpackCursor(value: string | null): ThreadCursor {
+  if (value === null) return NO_CURSOR;
+  const parts = value.split(CURSOR_SEP);
+  if (parts.length !== 3) return NO_CURSOR;
+  const [since, seen, marker] = parts as [string, string, string];
+  const instantOrEmpty = (stamp: string): boolean => stamp === '' || isIsoInstant(stamp);
+  if (!instantOrEmpty(since) || !instantOrEmpty(seen)) return NO_CURSOR;
+  return { since: since || null, seen: seen || null, marker: marker || undefined };
+}
+
+/** Milliseconds of an ISO or HTTP-date stamp, or NaN. */
+const ms = (stamp: string | null | undefined): number => (stamp ? Date.parse(stamp) : Number.NaN);
+
+/** An instant as GitHub writes one: ISO 8601, whole seconds. */
+const isoSeconds = (at: number): string => new Date(Math.floor(at / 1000) * 1000).toISOString().replace(/\.000Z$/, 'Z');
+
+/** True when `a` is a later instant than `b`; an unreadable stamp is never later. */
+const later = (a: string | null | undefined, b: string | null | undefined): boolean => {
+  const x = ms(a);
+  const y = ms(b);
+  return Number.isFinite(x) && Number.isFinite(y) && x > y;
+};
+
+/** True when `at` is at or after `since`; an unreadable stamp answers false. */
+const atOrAfter = (at: string | undefined, since: string): boolean => {
+  const x = ms(at);
+  const y = ms(since);
+  return Number.isFinite(x) && Number.isFinite(y) && x >= y;
+};
+
+/** The ring key of a polled event: its id without `poll:`, as the repository poll records it. */
+const ringKey = (event: NormalizedEvent): string => (event.id.startsWith('poll:') ? event.id.slice('poll:'.length) : event.id);
+
+const isClosedMarker = (marker: string): boolean => marker === 'closed' || marker.startsWith('issue:closed:');
+
+/**
+ * The marker `normalizePolledIssue` compares a thread's row against, which
+ * decides its state event. A thread whose cursor holds a delivered marker
+ * compares against it, except that a thread closed then and closed now has
+ * news only if it closed again since: an edit to a closed issue isn't a close,
+ * and a reopen and a close that no pass saw between them are. Any other
+ * thread compares as changed only where something happened at or after
+ * `since`: its opening, for a thread never read before, or its close.
+ */
+function previousMarkerFor(row: PolledIssue, cursor: ThreadCursor, since: string): string | undefined {
+  const current = polledMarker(row);
+  const known = cursor.seen !== null;
+  if (known && cursor.marker !== undefined) {
+    if (row.state === 'closed' && isClosedMarker(cursor.marker)) {
+      return later(row.closedAt, cursor.seen) ? undefined : current;
+    }
+    return cursor.marker;
+  }
+  if (!known && atOrAfter(row.createdAt, since)) return undefined;
+  if (row.state === 'closed' && atOrAfter(row.closedAt, since)) return undefined;
+  return current;
 }
 
 /**
- * What the last pass saw of a thread's own state, so a comment's bump (which
- * touches nothing here) can be told from a real state change — the same idea
- * as normalize.ts's `polledMarker`, computed from the mapped `Issue`/
- * `PullRequest` the tool contract already exposes rather than from the
- * `PolledIssue` row only the repository poll's list endpoints produce.
+ * The `since` `normalizePolledIssue` tells an opening by (`createdAt` at or
+ * after it). Only a thread never read before can have opened since W; for one
+ * read before, the instant after its creation says it didn't.
  */
-function stateMarkerOf(kind: ThreadKind, data: Issue | PullRequest): string {
-  if (kind === 'pull') {
-    const pull = data as PullRequest;
-    return pull.state === 'closed' ? 'closed' : pull.head.sha || 'unknown';
-  }
-  const issue = data as Issue;
-  const text = createHash('sha256').update(`${issue.title}\0${issue.body}`).digest('hex').slice(0, 16);
-  return `issue:${issue.state}:${text}`;
+function openedSince(row: PolledIssue, known: boolean, since: string): string {
+  const created = ms(row.createdAt);
+  return known && Number.isFinite(created) ? new Date(created + 1).toISOString() : since;
 }
 
-/**
- * Decide whether the marker moving means an event, and which one — mirrors
- * normalize.ts's `normalizePolledIssue` kind decision, but has no
- * `PolledIssue.id` to key a dedup entry on, so the caller builds `id` and this
- * only supplies the kind (or null: nothing reportable moved).
- *
- * A pull request's `closed → open` (reopened) is dropped, not reported: the
- * contract has no `pull.reopened` kind, the same gap `normalizeWebhook` and
- * the repository poll both already have.
- */
-function stateChangeKind(
-  kind: ThreadKind,
-  data: Issue | PullRequest,
-  previousMarker: string,
-  marker: string,
-): NormalizedEventKind | null {
-  if (kind === 'pull') {
-    const pull = data as PullRequest;
-    if (pull.state === 'closed') return 'pull.closed';
-    if (previousMarker === 'closed') return null;
-    return marker !== previousMarker ? 'pull.synchronize' : null;
-  }
-  const issue = data as Issue;
-  if (issue.state === 'closed') return 'issue.closed';
-  return previousMarker.startsWith('issue:closed:') ? 'issue.reopened' : 'issue.edited';
-}
-
-/** One candidate event, with the ring key it is delivered and recorded under. */
+/** One candidate event, with the time it sorts by. */
 interface Candidate {
-  key: string;
   event: NormalizedEvent;
   at: string;
 }
+
+/** The thread a retry entry names. */
+const retryThread = (r: NotificationRetry): ThreadRef => ({ repo: { owner: r.owner, name: r.name }, number: r.number, kind: r.kind });
+
+/** A retry entry for a thread: the passes it has failed in a row, and its cursor, so eviction from the head memory can't lose its place. */
+const retryEntry = (thread: ThreadRef, attempts: number, cursor: string | null): NotificationRetry => ({
+  owner: thread.repo.owner,
+  name: thread.repo.name,
+  number: thread.number,
+  kind: thread.kind,
+  attempts,
+  ...(cursor === null ? {} : { cursor }),
+});
+
+/** A thread whose new rows are more than one read takes, with its row as read, so its cursor can move to its current update. */
+class BacklogTooLarge extends Error {
+  constructor(readonly row: PolledIssue) {
+    super('more new comments or reviews than one read takes');
+  }
+}
+
+/**
+ * Why a thread's read or delivery failed: `lasting` will fail the same way
+ * again (gone, out of reach), `rate-limit` is GitHub's and passes with time,
+ * `backlog` is more new rows than one read takes, and `failed` is anything
+ * else. `cause` is written for the agent.
+ */
+interface ThreadFailure {
+  kind: 'lasting' | 'rate-limit' | 'failed' | 'backlog';
+  cause: string;
+}
+
+/** Who a server-made event comes from: neither GitHub nor the agent, so it is never from-self. */
+const SERVER_ACTOR: EventActor = { login: 'github-mcpl', isBot: true };
 
 export class NotificationsPoller {
   private readonly api: NotificationsPollerApi;
   private readonly state: NotificationsIngressState;
   private readonly configuredIntervalMs: number;
+  private readonly repos: readonly RepoRef[];
   private readonly onEvent: EventListener;
   private readonly logger: Logger;
   private readonly now: () => Date;
-  private readonly markRead: boolean;
-  /** The last `X-Poll-Interval` the API reported, in ms. Can only raise. */
+  /** The last `X-Poll-Interval` the API reported, in ms. */
   private serverIntervalMs = 0;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
@@ -206,22 +300,26 @@ export class NotificationsPoller {
     this.api = opts.api;
     this.state = opts.state;
     this.configuredIntervalMs = opts.intervalMs;
+    this.repos = opts.repos;
     this.onEvent = opts.onEvent;
     this.logger = opts.logger ?? silentLogger();
     this.now = opts.now ?? (() => new Date());
-    this.markRead = opts.markRead ?? false;
   }
 
   get enabled(): boolean {
     return this.configuredIntervalMs > 0;
   }
 
-  /** Same floor rule as poller.ts's `Poller.effectiveIntervalMs`. */
+  /**
+   * Same floor rule as poller.ts's `Poller.effectiveIntervalMs`: never below
+   * the floor or the configured interval, and never below the last
+   * `X-Poll-Interval` GitHub sent, which can go down again as well as up.
+   */
   get effectiveIntervalMs(): number {
     return Math.max(MIN_POLL_INTERVAL_MS, this.configuredIntervalMs, this.serverIntervalMs);
   }
 
-  /** Honour `X-Poll-Interval` (seconds); can only raise the interval, never lower it below the floor. */
+  /** Take `X-Poll-Interval` (seconds) as GitHub's latest word; an absent or unreadable header changes nothing. */
   observePollInterval(seconds: number | null): number {
     if (seconds === null || !Number.isFinite(seconds) || seconds <= 0) return this.effectiveIntervalMs;
     const asMs = Math.round(seconds * 1000);
@@ -238,6 +336,9 @@ export class NotificationsPoller {
   start(): void {
     if (!this.enabled || this.running) return;
     this.running = true;
+    // The first pass runs an interval from now; a first start's W is taken
+    // now, so that pass lists from an interval before the start.
+    this.watermark();
     this.schedule();
   }
 
@@ -269,206 +370,380 @@ export class NotificationsPoller {
   }
 
   /**
-   * One pass: ask `GET /notifications` since the last `Last-Modified`; a 304
-   * costs nothing more. Otherwise, for every thread this ingress maps, fetch
-   * what is new since that thread's own cursor, deliver it, and advance that
-   * thread's cursor only once every one of its events has been accepted —
-   * exactly the "record only after delivery" rule poller.ts documents.
+   * W as stored, or, at a first start, one interval before now, as App mode's
+   * repository poll begins. That start is stored at once, so a failed first
+   * pass doesn't move it, and logged, so an operator knows where delivery began.
+   */
+  private watermark(): NotificationsWatermark & { since: string } {
+    const stored = this.state.notificationsWatermark();
+    if (stored.since !== null) {
+      return { since: isoSeconds(ms(stored.since)), lastModified: stored.lastModified, answeredAt: stored.answeredAt };
+    }
+    const since = isoSeconds(this.now().getTime() - this.effectiveIntervalMs);
+    this.state.setNotificationsWatermark({ since, lastModified: null, answeredAt: null });
+    this.state.flush().catch((err: unknown) => {
+      this.logger.warn('state flush failed', { error: err instanceof Error ? err.message : String(err) });
+    });
+    this.logger.info('notifications: no stored watermark, so delivery begins one interval before this start', { since });
+    return { since, lastModified: null, answeredAt: null };
+  }
+
+  /**
+   * One pass: list the threads GitHub updated since W and read each, with
+   * every thread a past pass failed on; deliver what's new; move W on.
    */
   async pollOnce(): Promise<NotificationsPollResult> {
-    const startedAt = this.now();
-    const receivedAt = startedAt.toISOString();
-    const ifModifiedSince = this.state.lastPollAt();
+    const receivedAt = this.now().toISOString();
+    const { since, lastModified, answeredAt } = this.watermark();
+    // A new thread listed now wasn't in GitHub's previous answer, so what's
+    // new on it came after that answer, less the notification's delay. Before
+    // GitHub has answered, W.
+    const reachFrom = answeredAt ?? since;
 
-    const page = await this.api.listNotifications(ifModifiedSince);
+    const page = await this.api.listNotifications({ since, ifModifiedSince: lastModified });
     this.observePollInterval(page.pollIntervalSeconds);
 
     const result: NotificationsPollResult = {
       notModified: page.notModified,
       threads: 0,
+      outOfScope: 0,
       delivered: [],
       duplicates: 0,
       failed: 0,
+      dropped: 0,
+      truncated: page.truncated,
     };
-    if (page.notModified) {
-      this.logger.debug('notifications poll: not modified', { ifModifiedSince });
-      return result;
+
+    // The threads to read: first those a past pass failed on, so a busy
+    // listing can't keep them waiting, then those listed in scope. A retry
+    // outside GITHUB_REPOS (narrowed since it failed) is dropped unread.
+    const retries = new Map<string, NotificationRetry>();
+    let retriesOutOfScope = 0;
+    for (const retry of this.state.notificationRetries()) {
+      if (repoAllowed({ owner: retry.owner, name: retry.name }, this.repos)) retries.set(channelId(retryThread(retry)), retry);
+      else retriesOutOfScope += 1;
     }
+    if (retriesOutOfScope > 0) {
+      result.outOfScope += retriesOutOfScope;
+      this.logger.info('notifications: threads on the retry list are outside GITHUB_REPOS now, so they are dropped unread', {
+        threads: retriesOutOfScope,
+      });
+    }
+    this.state.setNotificationRetries([...retries.values()]);
+    const toRead = new Map<string, ThreadRef>();
+    for (const [channel, retry] of retries) toRead.set(channel, retryThread(retry));
+    for (const n of page.notifications) {
+      const thread: ThreadRef = { repo: n.repo, number: n.number, kind: n.kind };
+      if (!repoAllowed(n.repo, this.repos)) result.outOfScope += 1;
+      else if (!toRead.has(channelId(thread))) toRead.set(channelId(thread), thread);
+    }
+    result.threads = toRead.size;
 
-    const relevant = page.notifications.filter(
-      (n): n is NotificationRow & { kind: ThreadKind; number: number } => n.kind !== null && n.number !== null,
-    );
-    result.threads = relevant.length;
-
-    // Read once per pass; a key is written back only once its event is
-    // delivered (see `deliverThread`).
+    // The dedup ring as it stands, copied once a pass; each delivery adds its key.
     const alreadySeen = new Set(this.state.snapshot().pollKeys);
-    const bootstrapSince = new Date(startedAt.getTime() - this.effectiveIntervalMs).toISOString();
-    let anyFailed = false;
-
-    for (const notification of relevant) {
-      const thread: ThreadRef = { repo: notification.repo, number: notification.number, kind: notification.kind };
-      const outcome = await this.pollThread(thread, notification, bootstrapSince, receivedAt, alreadySeen);
+    let rateLimited = 0;
+    for (const [channel, thread] of toRead) {
+      const waiting = retries.get(channel);
+      const attemptsSoFar = waiting?.attempts ?? 0;
+      if (rateLimited > 0) {
+        // GitHub's rate limit ended this pass's reads: the rest wait for the next, uncounted.
+        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null)));
+        rateLimited += 1;
+        continue;
+      }
+      const outcome = await this.pollThread(thread, reachFrom, receivedAt, alreadySeen, waiting?.cursor ?? null);
       result.delivered.push(...outcome.delivered);
       result.duplicates += outcome.duplicates;
-      result.failed += outcome.failed;
-      if (outcome.failed > 0) anyFailed = true;
+      if (outcome.failure === null) {
+        retries.delete(channel);
+      } else {
+        result.failed += 1;
+        const place = this.state.polledHead(`notif:${channel}`);
+        if (outcome.failure.kind === 'rate-limit') {
+          rateLimited = 1;
+          // To the back of the list, so the thread that met the limit can't keep the rest waiting.
+          retries.delete(channel);
+          retries.set(channel, retryEntry(thread, attemptsSoFar, place));
+        } else {
+          const attempts = attemptsSoFar + 1;
+          if (outcome.failure.kind !== 'failed' || attempts >= NOTIFICATION_RETRY_LIMIT) {
+            retries.delete(channel);
+            result.dropped += 1;
+            result.delivered.push(...(await this.announceDrop(thread, outcome.failure, attempts, receivedAt)));
+          } else {
+            retries.set(channel, retryEntry(thread, attempts, place));
+          }
+        }
+      }
+      this.state.setNotificationRetries([...retries.values()]);
+      await this.state.flush();
     }
-
-    // The whole pass's Last-Modified only sticks if nothing failed: GitHub's
-    // conditional request has no finer grain than "since this instant", so
-    // holding it back is what makes a failed thread's row reappear next pass.
-    if (!anyFailed) {
-      this.state.setLastPollAt(page.lastModified ?? receivedAt);
-    } else {
-      this.logger.warn('notifications poll: Last-Modified held back; at least one thread failed this pass', {
-        threads: relevant.length,
+    if (rateLimited > 0) {
+      this.state.setNotificationRetries([...retries.values()]);
+      await this.state.flush();
+      this.logger.warn('notifications: GitHub rate-limited a read, so this pass read no further; those threads are read next pass', {
+        threads: rateLimited,
       });
     }
 
+    const next = page.notModified ? since : nextWatermark(page, since);
+    if (page.truncated) {
+      this.logger.error('notifications: the listing stopped at its page cap, so some threads GitHub notified between since and until were not listed or read', {
+        since,
+        until: next,
+        listed: page.notifications.length,
+      });
+    }
+    // W moves only on what a listing showed; a 304 leaves it, and records when GitHub answered.
+    const answered = ms(page.date);
+    this.state.setNotificationsWatermark({
+      since: next,
+      lastModified: page.notModified ? lastModified : conditional(page),
+      answeredAt: isoSeconds(Number.isFinite(answered) ? answered : ms(receivedAt)),
+    });
+    await this.state.flush();
     return result;
   }
 
-  /** Fetch, normalize and deliver one notification thread's new activity. */
+  /**
+   * Read one thread and deliver its new activity. The state event moves `seen`
+   * and the marker once it was delivered, so a refused comment can't make a
+   * delivered close come again. The cursor's `since` moves only once every row
+   * and the state event were delivered, so a refused opening is judged again
+   * from where it was, and its rows come again to the dedup ring.
+   */
   private async pollThread(
     thread: ThreadRef,
-    notification: NotificationRow,
-    bootstrapSince: string,
+    reachFrom: string,
     receivedAt: string,
-    alreadySeen: ReadonlySet<string>,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; failed: number }> {
+    alreadySeen: Set<string>,
+    held: string | null,
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; failure: ThreadFailure | null }> {
     const channel = channelId(thread);
     const cursorKey = `notif:${channel}`;
-    const previous = unpackCursor(this.state.polledHead(cursorKey));
-    const sinceForThread = previous.since ?? bootstrapSince;
-
-    let candidates: Candidate[];
-    let marker: string;
-    try {
-      const built = await this.collectCandidates(thread, notification.repo, sinceForThread, previous.marker, receivedAt);
-      candidates = built.candidates;
-      marker = built.marker;
-    } catch (err) {
-      this.logger.warn('notifications poll: fetching one thread failed; it will be retried next pass', {
-        channel,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return { delivered: [], duplicates: 0, failed: 1 };
+    // The head memory's cursor, or the one its retry entry kept if that was evicted.
+    const stored = this.state.polledHead(cursorKey) ?? held;
+    const cursor = unpackCursor(stored);
+    if (stored !== null && cursor === NO_CURSOR) {
+      this.logger.warn('notifications poll: a stored cursor was not one this poller writes, so the thread is read as never seen', { channel });
     }
+    // A thread with no cursor starts a notification's delay before GitHub's
+    // previous answer. One with a cursor starts a second early: GitHub's stamps
+    // are whole seconds, and a row written in the second the cursor names may
+    // have come after the read that set it.
+    const since = cursor.since === null ? firstReadSince(reachFrom) : isoSeconds(ms(cursor.since) - 1000);
 
-    candidates.sort((a, b) => (a.at === b.at ? a.key.localeCompare(b.key) : a.at.localeCompare(b.at)));
+    let read: { rows: Candidate[]; state: Candidate | null; row: PolledIssue };
+    try {
+      read = await this.readThread(thread, since, cursor, receivedAt);
+    } catch (err) {
+      if (err instanceof BacklogTooLarge) {
+        // The same read would meet the same cap again: read the thread from its current update on.
+        this.state.setPolledHead(cursorKey, packCursor({ ...cursor, since: err.row.updatedAt }));
+        this.logger.warn('notifications poll: a thread has more new activity than one read takes; it is read from its current update on', {
+          channel,
+        });
+        return {
+          delivered: [],
+          duplicates: 0,
+          failure: { kind: 'backlog', cause: 'it had more than 2,000 comments or reviews to read at once' },
+        };
+      }
+      const kind = isLastingFailure(err) ? 'lasting' : isRateLimit(err) ? 'rate-limit' : 'failed';
+      this.logger.warn(
+        kind === 'lasting'
+          ? 'notifications poll: a thread is gone or out of reach'
+          : 'notifications poll: reading a thread failed; it is read again next pass',
+        { channel, error: err instanceof Error ? err.message : String(err) },
+      );
+      this.holdPlace(thread, reachFrom, held);
+      return { delivered: [], duplicates: 0, failure: { kind, cause: describeFailure(err) } };
+    }
 
     const delivered: NormalizedEvent[] = [];
     let duplicates = 0;
-    let failed = 0;
-    for (const candidate of candidates) {
-      if (alreadySeen.has(candidate.key)) {
-        duplicates += 1;
-        continue;
-      }
-      try {
-        await this.onEvent(candidate.event);
-      } catch (err) {
-        failed += 1;
-        this.logger.warn('notifications poll: event delivery failed; its key stays unrecorded for the next pass', {
-          key: candidate.key,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        continue;
-      }
-      this.state.seenPollKey(candidate.key);
-      delivered.push(candidate.event);
-    }
-
-    // The cursor (and the optional mark-as-read) only move once this
-    // thread's whole batch is through: a refused delivery must leave the
-    // cursor where it was, or the row that produced it is never asked about
-    // again.
-    if (failed === 0) {
-      this.state.setPolledHead(cursorKey, packCursor(receivedAt, marker));
-      if (this.markRead) {
-        try {
-          await this.api.markNotificationThreadRead(notification.id);
-        } catch (err) {
-          // Best-effort: GitHub still has the thread as unread, which costs
-          // nothing but a slightly noisier inbox.
-          this.logger.warn('notifications poll: marking a thread read failed (harmless)', {
-            id: notification.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
+    const deliver = async (candidates: Candidate[]): Promise<string | null> => {
+      let refusal: string | null = null;
+      for (const { event } of candidates) {
+        const key = ringKey(event);
+        if (alreadySeen.has(key)) {
+          duplicates += 1;
+          continue;
         }
+        try {
+          await this.onEvent(event);
+        } catch (err) {
+          refusal = err instanceof Error ? err.message : String(err);
+          this.logger.warn('notifications poll: event delivery failed; its key stays unrecorded for the next pass', { key, error: refusal });
+          continue;
+        }
+        this.state.seenPollKey(key);
+        alreadySeen.add(key);
+        delivered.push(event);
       }
-    }
+      return refusal;
+    };
 
-    return { delivered, duplicates, failed };
+    read.rows.sort((a, b) => (a.at === b.at ? a.event.id.localeCompare(b.event.id) : ms(a.at) - ms(b.at)));
+    const rowsRefused = await deliver(read.rows);
+    const stateRefused = read.state ? await deliver([read.state]) : null;
+
+    this.state.setPolledHead(
+      cursorKey,
+      packCursor({
+        since: rowsRefused === null && stateRefused === null ? read.row.updatedAt : (cursor.since ?? since),
+        seen: stateRefused === null ? read.row.updatedAt : cursor.seen,
+        marker: stateRefused === null ? polledMarker(read.row) : cursor.marker,
+      }),
+    );
+    const failure = rowsRefused ?? stateRefused;
+    return {
+      delivered,
+      duplicates,
+      failure: failure === null ? null : { kind: 'failed', cause: `the host refused one of its events (${failure})` },
+    };
   }
 
-  /** Every new comment, review comment, submitted review and state change on one thread. */
-  private async collectCandidates(
+  /**
+   * Every new comment, review comment and submitted review on one thread, and
+   * its state event if it has one. The thread's row is read first, so its
+   * `updated_at` bounds every row the reads after it could have missed.
+   */
+  private async readThread(
     thread: ThreadRef,
-    repo: RepoRef,
     since: string,
-    previousMarker: string | undefined,
+    cursor: ThreadCursor,
     receivedAt: string,
-  ): Promise<{ candidates: Candidate[]; marker: string }> {
-    const candidates: Candidate[] = [];
-
-    for (const c of await this.api.listComments(thread, since)) {
-      const row: PolledComment = {
-        id: c.id,
-        number: thread.number,
-        author: c.author,
-        body: c.body,
-        updatedAt: c.updatedAt,
-        html_url: c.html_url,
-        ...(c.path !== undefined ? { path: c.path } : {}),
-        ...(c.inReplyTo !== undefined ? { inReplyTo: c.inReplyTo } : {}),
-      };
-      const event = normalizePolledComment(repo, row, 'issue_comment', receivedAt);
-      candidates.push({ key: event.id, event, at: row.updatedAt });
+  ): Promise<{ rows: Candidate[]; state: Candidate | null; row: PolledIssue }> {
+    const row = await this.api.getPolledThread(thread);
+    let rows: Candidate[];
+    try {
+      rows = await this.readRows(thread, since, row, receivedAt);
+    } catch (err) {
+      if (err instanceof ReadCapError) throw new BacklogTooLarge(row);
+      throw err;
     }
 
+    const known = cursor.seen !== null;
+    const stateEvent = normalizePolledIssue(
+      thread.repo,
+      row,
+      receivedAt,
+      openedSince(row, known, since),
+      previousMarkerFor(row, cursor, since),
+    );
+    return { rows, state: stateEvent ? { event: stateEvent, at: row.updatedAt } : null, row };
+  }
+
+  /** A thread's comments since `since`, and for a pull request its review comments and reviews, as candidate events. */
+  private async readRows(thread: ThreadRef, since: string, row: PolledIssue, receivedAt: string): Promise<Candidate[]> {
+    const rows: Candidate[] = [];
+    for (const comment of await this.api.listCommentsSince(thread, since)) {
+      rows.push({ event: normalizePolledComment(thread.repo, comment, 'issue_comment', receivedAt), at: comment.updatedAt });
+    }
     if (thread.kind === 'pull') {
-      const reviewComments = (await this.api.listReviewCommentsSince(repo, since)).filter(
-        (row) => row.number === thread.number,
-      );
-      for (const row of reviewComments) {
-        const event = normalizePolledComment(repo, row, 'review_comment', receivedAt);
-        candidates.push({ key: event.id, event, at: row.updatedAt });
+      for (const comment of await this.api.listPullReviewCommentsSince(thread, since)) {
+        rows.push({ event: normalizePolledComment(thread.repo, comment, 'review_comment', receivedAt), at: comment.updatedAt });
       }
-
-      for (const row of await this.api.listReviewsSince(thread, since)) {
-        const event = normalizePolledReview(repo, thread, row, receivedAt);
-        candidates.push({ key: event.id, event, at: row.submittedAt });
-      }
-    }
-
-    const current = thread.kind === 'pull' ? await this.api.getPullRequest(thread) : await this.api.getIssue(thread);
-    const marker = stateMarkerOf(thread.kind, current);
-    if (previousMarker !== undefined && previousMarker !== marker) {
-      const kind = stateChangeKind(thread.kind, current, previousMarker, marker);
-      if (kind) {
-        const key = `notif-state:${channelId(thread)}:${marker}`;
-        candidates.push({
-          key: `poll:${key}`,
-          at: current.updatedAt,
-          event: {
-            id: `poll:${key}`,
-            receivedAt,
-            repo,
-            kind,
-            thread,
-            actor: current.author,
-            title: current.title,
-            body: current.body,
-            html_url: current.html_url,
-            ...(thread.kind === 'pull' ? { sha: (current as PullRequest).head.sha } : {}),
-            raw: current,
-          },
+      for (const review of await this.api.listReviewsSince(thread, since)) {
+        rows.push({
+          event: normalizePolledReview(thread.repo, thread, review, receivedAt, {
+            title: row.title,
+            ...(row.headSha === undefined ? {} : { headSha: row.headSha }),
+          }),
+          at: review.submittedAt,
         });
       }
     }
-
-    return { candidates, marker };
+    return rows;
   }
+
+  /**
+   * Keep a thread's place while it waits on the retry list, and answer it for
+   * the list's entry: a thread never read keeps where its first read would
+   * have started, so a later read still covers what this one couldn't, and
+   * rewriting the cursor keeps it among the newest in the bounded head memory.
+   */
+  private holdPlace(thread: ThreadRef, reachFrom: string, held: string | null): string {
+    const cursorKey = `notif:${channelId(thread)}`;
+    const cursor = unpackCursor(this.state.polledHead(cursorKey) ?? held);
+    const place = packCursor({ ...cursor, since: cursor.since ?? firstReadSince(reachFrom) });
+    this.state.setPolledHead(cursorKey, place);
+    return place;
+  }
+
+  /**
+   * Tell the agent, on the thread's own channel, that the poller stopped
+   * reading a thread, and why. The server's own event handler doesn't throw
+   * when no host is connected or a send fails, so a refusal here means the
+   * event itself couldn't be built, which a retry would meet again: it's
+   * logged, and nothing else carries it.
+   */
+  private async announceDrop(thread: ThreadRef, failure: ThreadFailure, attempts: number, receivedAt: string): Promise<NormalizedEvent[]> {
+    const channel = channelId(thread);
+    const said =
+      failure.kind === 'backlog'
+        ? `github-mcpl skipped this thread's backlog: ${failure.cause}, more than one read takes. ` +
+          'It reads the thread from its latest update on, so its new activity arrives as usual. The read tools show the backlog.'
+        : `github-mcpl stopped reading this thread's new activity: ${
+            failure.kind === 'lasting'
+              ? `${failure.cause}, so the thread is gone or out of this token's reach`
+              : `its last ${attempts} attempts in a row failed (the last: ${failure.cause})`
+          }. It reads the thread again if it moves on GitHub. Until then, the read tools show what is there.`;
+    const event: NormalizedEvent = {
+      id: `poll:read_failed:${channel}:${receivedAt}`,
+      receivedAt,
+      repo: thread.repo,
+      kind: 'thread.read_failed',
+      thread,
+      actor: SERVER_ACTOR,
+      html_url: `https://github.com/${thread.repo.owner}/${thread.repo.name}/${thread.kind === 'pull' ? 'pull' : 'issues'}/${thread.number}`,
+      body: said,
+    };
+    if (failure.kind === 'backlog') this.logger.warn('notifications: skipped a thread\'s backlog; it is read from its latest update on', { channel });
+    else this.logger.error('notifications: stopped reading a thread until it next moves', { channel, attempts, error: failure.cause });
+    try {
+      await this.onEvent(event);
+      return [event];
+    } catch (err) {
+      this.logger.error('notifications: the event announcing a dropped thread was refused', {
+        channel,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    }
+  }
+}
+
+/** Where a thread with no cursor starts its reads: {@link NOTIFICATION_DELAY_MS} before GitHub's previous answer (W at a first start). */
+function firstReadSince(reachFrom: string): string {
+  return isoSeconds(ms(reachFrom) - NOTIFICATION_DELAY_MS);
+}
+
+/**
+ * W for the next listing: the listing's `Last-Modified`, or failing that the
+ * newest stamp it listed, a second early, so a thread GitHub updated in that
+ * second is listed again rather than missed. W rests only on stamps a listing
+ * showed: it never goes back before `since`, and stays there when a listing
+ * without `Last-Modified` listed nothing.
+ */
+function nextWatermark(page: NotificationsPage, since: string): string {
+  const newestListed = page.notifications.reduce((max, n) => Math.max(max, ms(n.updatedAt) || 0), 0);
+  const stamp = page.lastModified !== null ? ms(page.lastModified) : newestListed > 0 ? newestListed : Number.NaN;
+  if (!Number.isFinite(stamp)) return since;
+  return isoSeconds(Math.max(stamp - 1000, ms(since)));
+}
+
+/**
+ * The `If-Modified-Since` for the next listing: this one's `Last-Modified`,
+ * unless the inbox changed in the second GitHub answered, when something
+ * written later in that second would get a 304. Then the next listing goes
+ * unconditional.
+ */
+function conditional(page: NotificationsPage): string | null {
+  if (page.lastModified === null) return null;
+  const changed = ms(page.lastModified);
+  const answered = ms(page.date);
+  if (Number.isFinite(answered) && Number.isFinite(changed) && answered - changed < 1000) return null;
+  return page.lastModified;
 }

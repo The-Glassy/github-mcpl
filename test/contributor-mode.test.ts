@@ -10,7 +10,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -34,6 +34,8 @@ function tmpFile(name: string, contents: string, mode = 0o600): string {
   const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-contrib-'));
   const file = join(dir, name);
   writeFileSync(file, contents, { mode });
+  // The umask narrows a mode given at creation; chmod sets it as asked.
+  chmodSync(file, mode);
   return file;
 }
 
@@ -65,6 +67,23 @@ test('GITHUB_TOKEN_FILE alone selects contributor mode', () => {
   assert.equal(config.webhookPort, null);
   // The poller is always on in this mode, at the floor, when unset.
   assert.equal(config.pollIntervalMs, MIN_POLL_INTERVAL_MS);
+});
+
+test('a token file that an editor began with a byte-order mark or a blank line still gives the bare token', () => {
+  const tokenFile = tmpFile('token', '\uFEFF\n  ghp_fake_token_for_tests\n');
+  const config = readConfig({ GITHUB_TOKEN_FILE: tokenFile, GITHUB_REPOS: 'anima-research/rayforce', GITHUB_BOT_LOGIN: 'a-human' });
+  assert.equal(config.userToken, 'ghp_fake_token_for_tests');
+});
+
+test('GITHUB_APP_INSTALLATION_ID beside GITHUB_TOKEN_FILE is refused rather than ignored', () => {
+  const tokenFile = tmpFile('token', 'ghp_fake_token_for_tests\n');
+  const problems = problemsOf({
+    GITHUB_TOKEN_FILE: tokenFile,
+    GITHUB_APP_INSTALLATION_ID: '42',
+    GITHUB_REPOS: 'anima-research/rayforce',
+    GITHUB_BOT_LOGIN: 'a-human',
+  });
+  assert.deepEqual(problems.map((p) => p.split(':')[0]), ['GITHUB_APP_INSTALLATION_ID']);
 });
 
 test('neither GITHUB_APP_ID/KEY nor GITHUB_TOKEN_FILE names the same App-mode problems as before', () => {

@@ -30,6 +30,7 @@ capability grant's decision; a tag only influences treatment afterwards.
 | `pull_request_review_comment` (`edited`) | `listReviewCommentsSince` | `review_comment.edited` | pull |
 | `check_suite` (`completed`) | `getCheckRuns` on an open PR head | `checks.completed` | pull |
 | `push` | — | `push` | *none* |
+| — (contributor mode only: the notifications poller stopped reading a thread) | — | `thread.read_failed` | issue or pull |
 
 A `push` event carries no thread, so its channel id, `metadata.number` and
 `metadata.kind` are absent — a recipe that routes on a thread must not expect
@@ -60,6 +61,16 @@ pair**, and then the rows below.
 | `review_comment.edited` | `github:review-comment` | `chat:thread`, `chat:edited` |
 | `checks.completed` | `github:ci=failure`, or `github:ci=success`, or *neither* — see below | |
 | `push` | `github:push` | |
+| `thread.read_failed` | `github:read-failed` | |
+
+A `thread.read_failed` event is contributor mode's notifications poller saying,
+on the thread's own channel, that it stopped reading that thread's new
+activity: after five passes in a row that failed, or at once for a thread gone
+or out of the token's reach. Its body names the cause. The poller reads the
+thread again, from where it left off while its place is among the last 200
+threads it read, when the thread next moves on GitHub; until then, the read
+tools show what arrived. Its actor is `github-mcpl`, never the agent, and it
+carries `chat:mention` (§4), since the server addresses it to the agent.
 
 A conversation comment carries no `github:` tag of its own: the core
 vocabulary already says everything a recipe routes on (who wrote it, whether
@@ -102,7 +113,7 @@ are not in the contract's ingress.
 
 | Tag | When |
 |---|---|
-| `chat:mention` | `event.body` @-mentions the bot — both `@name` and `@name[bot]` spellings, case-insensitively, for a `GITHUB_BOT_LOGIN` of `name[bot]`. Body only: a mention in a title notifies nobody on GitHub. Only on kinds that bring their text — `issue.opened`, `issue.edited`, `pull.opened`, `comment.created`, `comment.edited`, `review.submitted`, `review_comment.created`, `review_comment.edited`: a close, a reopen, new commits or a deleted comment re-carry a body the bot already saw. A thread the bot took part in still wakes it on those through `chat:reply`. |
+| `chat:mention` | `event.body` @-mentions the bot — both `@name` and `@name[bot]` spellings, case-insensitively, for a `GITHUB_BOT_LOGIN` of `name[bot]`. Body only: a mention in a title notifies nobody on GitHub. Only on kinds that bring their text — `issue.opened`, `issue.edited`, `pull.opened`, `comment.created`, `comment.edited`, `review.submitted`, `review_comment.created`, `review_comment.edited`: a close, a reopen, new commits or a deleted comment re-carry a body the bot already saw. A thread the bot took part in still wakes it on those through `chat:reply`. On a `thread.read_failed` event, always: there it means addressed to the agent by the server, not a person's @-mention. |
 | `chat:reply` | `ctx.isOwnThread` (the bot authored the thread or has commented in it) **or** `ctx.isReplyToSelf` (see §5) |
 | `chat:ambient` | neither of the above |
 

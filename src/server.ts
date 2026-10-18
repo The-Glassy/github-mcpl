@@ -1278,9 +1278,10 @@ export class GitHubMcplServer {
   // ── The event pipeline ────────────────────────────────────────────────────
 
   /**
-   * Both ingress paths hand every event here: the webhook listener and the
-   * poller take this as their `onEvent`, so one pipeline tags, renders and
-   * forwards whatever arrived, however it arrived.
+   * Every ingress path hands its events here: App mode's webhook listener and
+   * repository poller, and contributor mode's notifications poller, take this
+   * as their `onEvent`, so one pipeline tags, renders and forwards whatever
+   * arrived, however it arrived.
    */
   readonly onEvent = (event: NormalizedEvent): Promise<void> => this.handleEvent(event);
 

@@ -103,10 +103,17 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
   // Contributor mode has one ingress, the notifications poller, and no
   // webhook (readConfig already refused GITHUB_WEBHOOK_PORT in this mode).
   if (config.authMode === 'token') {
+    const problems = [await api.tokenLoginProblem(config.botLogin), ...(await api.repoSpellingProblems(config.repos))];
+    const found = problems.filter((p): p is string => p !== null);
+    if (found.length > 0) {
+      for (const problem of found) log.error(problem);
+      process.exit(1);
+    }
     const notifications = new NotificationsPoller({
       api,
       state,
       intervalMs: config.pollIntervalMs,
+      repos: config.repos,
       onEvent: server.onEvent,
       logger: log,
     });
