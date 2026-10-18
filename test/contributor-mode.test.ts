@@ -107,6 +107,11 @@ test('both an App key and a token is refused as ambiguous, by name, and nothing 
   });
   assert.equal(problems.length, 1, `expected exactly one problem, got ${JSON.stringify(problems)}`);
   assert.match(problems[0], /^GITHUB_TOKEN_FILE: set together with/);
+  // Either App variable alone beside the token is just as ambiguous.
+  for (const appVariable of [{ GITHUB_APP_ID: '12345' }, { GITHUB_APP_PRIVATE_KEY_FILE: pem }]) {
+    const alone = problemsOf({ ...appVariable, GITHUB_TOKEN_FILE: tokenFile, GITHUB_REPOS: 'anima-research/rayforce', GITHUB_BOT_LOGIN: 'a-human' });
+    assert.ok(alone.some((p) => /^GITHUB_TOKEN_FILE: set together with/.test(p)), `${Object.keys(appVariable)[0]}: ${JSON.stringify(alone)}`);
+  }
 });
 
 test('GITHUB_TOKEN_FILE is read as a secret file: required, mode 600, non-empty', () => {

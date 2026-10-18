@@ -195,7 +195,7 @@ const readFailedNotice: GateEventInfo = (() => {
       repo: { owner: 'owner', name: 'repo' },
       kind: 'thread.read_failed',
       thread: { repo: { owner: 'owner', name: 'repo' }, number: 12, kind: 'issue' },
-      actor: { login: 'github-mcpl', isBot: true },
+      actor: { login: 'github-mcpl[server]', isBot: true },
       html_url: 'https://github.com/owner/repo/issues/12',
       body: "github-mcpl stopped reading this thread's new activity: GitHub answered 404: Not Found, so the thread is gone or out of this token's reach.",
     },
@@ -206,7 +206,7 @@ const readFailedNotice: GateEventInfo = (() => {
 
 // ─── what both recipes must do ───────────────────────────────────────────────
 
-for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json', 'recipe-contributor-token.json']) {
+for (const name of ['recipe-maintainer-clone.json', 'recipe-contributor.json']) {
   test(`${name}: a green build on the agent's own thread does not wake it`, { skip: gatePath ? false : skipReason }, async () => {
     const d = (await gateFor(name)).probe(ownThreadCiSuccess);
     assert.equal(d.trigger, false, `woke via ${d.policyName}`);

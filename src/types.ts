@@ -386,9 +386,16 @@ export interface PolledIssue {
   /**
    * When it was last closed, from `closed_at`. Contributor mode's
    * notifications poller reads it for a thread it has no marker for: a close
-   * before the watermark is old news, one after it is an event.
+   * before that thread's first read starts (five minutes before GitHub's
+   * previous answer to a listing, or, at a first start, five minutes before
+   * W) is old news, one after it is an event.
    */
   closedAt?: string;
+  /**
+   * Pull requests only: whether it was merged, from the row's
+   * `pull_request.merged_at`. Absent when the row doesn't say.
+   */
+  merged?: boolean;
 }
 
 /**
@@ -1047,8 +1054,9 @@ export interface Config {
    * accepted as long as they share one owner, which is one App installation
    * and so one token; a second owner is a second server process. In
    * contributor mode several owners are accepted: the one token authenticates
-   * everywhere the user can reach, and this list only bounds writes — reads
-   * follow whatever the notifications poller sees.
+   * everywhere the user can reach, and this list bounds what reaches the
+   * agent as well as what it can do: the notifications poller drops threads
+   * from any other repository, and the tools refuse them, reads included.
    */
   repos: RepoRef[];
   /**

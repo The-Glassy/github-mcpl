@@ -131,10 +131,11 @@ export const POLL_PR_HEAD_LIMIT = 20;
 /** `GET /notifications` serves at most 50 threads a page. */
 const NOTIFICATIONS_PAGE_SIZE = 50;
 /**
- * Pages one of contributor mode's reads asks for (the notifications list, or
- * one thread's comments, review comments or reviews since its cursor) before
- * it fails rather than return part of the rows, whose cursor couldn't safely
- * move over a part. A failed read is retried next pass, with its cause logged.
+ * Pages one of contributor mode's reads takes. A thread's read (its comments,
+ * review comments or reviews since its cursor) fails past them rather than
+ * return part of its rows, since its cursor couldn't safely move over a part,
+ * and the poller then reads that thread from its current update on. The
+ * notifications list delivers what its pages held, and says it was cut short.
  */
 const THREAD_MAX_PAGES = 20;
 /** A rate limit's message, primary or secondary: a 403 that says this will pass. */
@@ -280,7 +281,8 @@ interface ApiIssue {
   created_at?: string | null;
   updated_at?: string | null;
   html_url?: string | null;
-  pull_request?: unknown;
+  /** Present on a pull request's row; `merged_at` is null until it's merged. */
+  pull_request?: { merged_at?: string | null } | null;
   closed_at?: string | null;
   closed_by?: ApiActor | null;
 }
@@ -1193,8 +1195,10 @@ export class GitHubAdapter implements GitHubApi {
    * repository reaches the answer.
    */
   async searchIssues(repo: RepoRef, query: string, limit: number = LIMITS.listEntries): Promise<IssueSearch> {
-    // A qualifier counts after the start, a space, a bracket or a quote, as
-    // GitHub reads `"x"user:octocat`; dropping it leaves the rest as written.
+    // A qualifier counts wherever no letter, digit, underscore or hyphen comes
+    // right before it, which takes in GitHub's own reading of
+    // `"x"user:octocat` (a live search, October 2026); dropping it leaves the
+    // rest as written.
     const scrubbed = query.replace(/(?<![\w-])-?(?:repo|user|org|owner):[^\s()]+/gi, ' ').replace(/\s+/g, ' ').trim();
     if (scrubbed !== query.trim()) {
       this.log('debug', 'dropped a repo:, user:, org: or owner: qualifier from a search; searches stay inside the allow-list', {
@@ -1612,12 +1616,14 @@ export class GitHubAdapter implements GitHubApi {
   /**
    * A thread's row as the issues endpoint gives it, which a pull request has
    * too: its state, when it was opened and closed, and who closed it, which
-   * for a merged pull request is whoever merged it. An open pull request also
-   * gets its head sha, from `GET pulls/{n}` (no check runs: the poller
-   * doesn't read them).
+   * for a merged pull request is whoever merged it. No head sha, so the
+   * poller reports no new commits: GitHub lists a pull request's thread when
+   * someone pushes to it, and a pass that reads it then finds nothing new.
+   * The agent learns of new commits from what comes with them, or by reading
+   * the pull request.
    */
   async getPolledThread(thread: ThreadRef): Promise<PolledIssue> {
-    const row = await this.call('getPolledThread', async () => {
+    return this.call('getPolledThread', async () => {
       const res = await this.octokit.request('GET /repos/{owner}/{repo}/issues/{issue_number}', {
         owner: thread.repo.owner,
         repo: thread.repo.name,
@@ -1625,18 +1631,6 @@ export class GitHubAdapter implements GitHubApi {
       });
       return polledIssueOf(res.data as ApiIssue);
     });
-    if (row.isPullRequest && row.state === 'open') {
-      const head = await this.call('getPolledThread', async () => {
-        const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-          owner: thread.repo.owner,
-          repo: thread.repo.name,
-          pull_number: thread.number,
-        });
-        return (res.data as ApiPull).head?.sha ?? '';
-      });
-      if (head) row.headSha = head;
-    }
-    return row;
   }
 
   /** A thread's conversation comments updated at or after `since`, every page, oldest first. */
@@ -1672,27 +1666,56 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * A pull request's reviews submitted at or after `since`, oldest first:
-   * every page of `GET pulls/{n}/reviews`, which takes no `since`, so this
-   * method is the filter. At or after, not after: a review submitted in the
-   * second the cursor names comes again, and the dedup ring drops it.
+   * A pull request's reviews submitted at or after `since`, in the order they
+   * were submitted, which is the order `GET pulls/{n}/reviews` lists them in.
+   * That list takes no `since`, so this reads its first page, whose `Link`
+   * header names the last, then reads back from the last page to the first page
+   * that starts before `since`. A read costs page 1 and those pages, whatever
+   * the pull request's history. At or after, not after: a review submitted in
+   * the second the cursor names comes again, and the poller drops it. More than
+   * {@link THREAD_MAX_PAGES} pages holding new reviews fail the read, as the
+   * other per-thread reads do ({@link ReadCapError}), and so does a `Link` that
+   * names a next page but no last, which this read couldn't walk back from.
    */
   async listReviewsSince(pull: ThreadRef, since: string): Promise<PolledReview[]> {
     const sinceMs = Date.parse(since);
-    const rows = await this.everyPage<ApiReview>('listReviewsSince', (page) =>
-      this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
-        owner: pull.repo.owner,
-        repo: pull.repo.name,
-        pull_number: pull.number,
-        per_page: 100,
-        page,
-      }),
-    );
+    const submitted = (row: ApiReview): number => Date.parse(row.submitted_at ?? '');
+    const read = (page: number) =>
+      this.call('listReviewsSince', async () => {
+        const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
+          owner: pull.repo.owner,
+          repo: pull.repo.name,
+          pull_number: pull.number,
+          per_page: 100,
+          page,
+        });
+        if (!Array.isArray(res.data)) throw new GitHubApiError(0, `GitHub answered page ${page} with something other than a list`, 'listReviewsSince');
+        return { rows: res.data as ApiReview[], last: lastPageOf((res.headers as Record<string, string | undefined>).link) };
+      });
+    const first = await read(1);
+    const last = first.last;
+    if (last === null) {
+      throw new GitHubApiError(0, 'its reviews list named a next page but no last page, so it could not be read from the newest back', 'listReviewsSince');
+    }
+    let rows: ApiReview[] = [];
+    let page = last;
+    while (page > 1) {
+      if (last - page >= THREAD_MAX_PAGES) throw new ReadCapError('listReviewsSince');
+      const batch = (await read(page)).rows;
+      rows = [...batch, ...rows];
+      if (batch.some((row) => submitted(row) < sinceMs)) break;
+      page -= 1;
+    }
+    if (page === 1) {
+      // Every page after it was new: page 1 counts against the cap only if it holds a new review too.
+      if (last > THREAD_MAX_PAGES && first.rows.some((row) => submitted(row) >= sinceMs)) throw new ReadCapError('listReviewsSince');
+      rows = [...first.rows, ...rows];
+    }
     const newer = rows.filter((row) => {
-      const at = Date.parse(row.submitted_at ?? '');
+      const at = submitted(row);
       return Number.isFinite(at) && (!Number.isFinite(sinceMs) || at >= sinceMs);
     });
-    newer.sort((a, b) => Date.parse(a.submitted_at ?? '') - Date.parse(b.submitted_at ?? ''));
+    newer.sort((a, b) => submitted(a) - submitted(b));
     return newer.map(mapPolledReview);
   }
 
@@ -1702,7 +1725,6 @@ export class GitHubAdapter implements GitHubApi {
    * fails rather than return part of the rows, since a cursor can't safely
    * move over a part ({@link ReadCapError}). The poller then reads the thread
    * from its current update on, and its notice says the backlog was skipped.
-   * A pull request's reviews count whole, since their endpoint takes no since.
    */
   private async everyPage<T>(operation: string, fetchPage: (page: number) => Promise<{ data: unknown }>): Promise<T[]> {
     const rows: T[] = [];
@@ -1976,7 +1998,19 @@ function polledIssueOf(row: ApiIssue): PolledIssue {
     html_url: row.html_url ?? '',
     ...(row.closed_by ? { closedBy: actorOf(row.closed_by) } : {}),
     ...(row.closed_at ? { closedAt: row.closed_at } : {}),
+    ...(row.pull_request?.merged_at === undefined ? {} : { merged: typeof row.pull_request.merged_at === 'string' }),
   };
+}
+
+/**
+ * The page a `Link` header names `rel="last"`: 1 when it names no next page
+ * either, as on a list's only page, and null when it names a next page but no
+ * last, as a list paged by cursor would.
+ */
+function lastPageOf(link: string | undefined): number | null {
+  const m = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(link ?? '');
+  if (m) return Number(m[1]);
+  return /rel="next"/.test(link ?? '') ? null : 1;
 }
 
 /**

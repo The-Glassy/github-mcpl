@@ -185,7 +185,7 @@ const TAG_TABLE: Row[] = [
   },
   {
     kind: 'thread.read_failed',
-    event: { actor: { login: 'github-mcpl', isBot: true } },
+    event: { actor: { login: 'github-mcpl[server]', isBot: true } },
     // Addressed to the agent by the server, so the advisory's ambient-bot mute can't reach it.
     tags: ['chat:from-bot', 'chat:mention', 'github:read-failed'],
   },

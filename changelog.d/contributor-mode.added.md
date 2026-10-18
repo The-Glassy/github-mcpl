@@ -7,4 +7,7 @@
   (tags `github:read-failed` and `chat:mention`). The webhook listener is refused in this mode.
 - **`search_issues`**, in both modes, drops `user:`, `org:` and `owner:` qualifiers from a query as it already
   dropped `repo:`, since GitHub widens a search to each of them, and leaves out any result from another
-  repository on the page, saying how many. Otherwise App mode is unchanged.
+  repository on the page, saying how many.
+- **A polled merge** is tagged `github:pr=merged` beside `github:pr=closed`, as a webhook delivery's is, in App
+  mode's repository poll too: the issues endpoint's row says whether a pull request was merged. Otherwise App
+  mode is unchanged.

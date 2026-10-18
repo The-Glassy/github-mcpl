@@ -17,9 +17,11 @@ import { test } from 'node:test';
 import { NotificationsPoller, type NotificationsPollerApi } from '../src/notifications-poller.js';
 import { GithubState } from '../src/state.js';
 import { GitHubApiError, ReadCapError, type NotificationRow, type NotificationsPage } from '../src/github-adapter.js';
+import { tagsFor } from '../src/tags.js';
 import {
   channelId,
   MIN_POLL_INTERVAL_MS,
+  POLL_DEDUP_RING,
   type EventActor,
   type NormalizedEvent,
   type PolledComment,
@@ -55,7 +57,6 @@ function threadRow(thread: ThreadRef, partial: Partial<PolledIssue> = {}): Polle
     createdAt: '2026-10-01T00:00:00Z',
     updatedAt: '2026-10-15T00:09:30Z',
     html_url: `https://github.com/anima-research/rayforce/${thread.kind === 'pull' ? 'pull' : 'issues'}/${thread.number}`,
-    ...(thread.kind === 'pull' ? { headSha: 'head-1' } : {}),
     ...partial,
   };
 }
@@ -247,6 +248,11 @@ test('X-Poll-Interval sets the interval on a 304 too, and a later, shorter one l
 // ─────────────────────────────────────────────────────────────────────────────
 // What a pass reads
 
+test('an interval longer than setTimeout keeps waits as long as it can, not a millisecond', () => {
+  const poller = new NotificationsPoller({ api: new FakeGitHub(), state: GithubState.load(null), intervalMs: 10 ** 12, repos: [REPO], onEvent: async () => {} });
+  assert.equal(poller.effectiveIntervalMs, 2 ** 31 - 1);
+});
+
 test('a notification from a repository outside GITHUB_REPOS is dropped unread', async () => {
   const r = rig();
   const outside: ThreadRef = { repo: ELSEWHERE, number: 3, kind: 'issue' };
@@ -278,6 +284,31 @@ test('comments are delivered once, keyed in the ring as the repository poll keys
   assert.deepEqual(r.events.map((e) => e.id).slice(2), ['poll:issue_comment:3:2026-10-15T00:09:30Z', 'poll:issue_comment:4:2026-10-15T00:10:30Z']);
 });
 
+test('a thread quiet while the dedup ring turned over doesn\'t bring its last comments again when it moves, across a restart', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-')), 'state.json');
+  const r = rig({ stateFile: file });
+  r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+  // Two comments at the cursor's edge: the second the thread's update names, and the one before it.
+  r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:29Z'), comment(3, 7, '2026-10-15T00:09:30Z')]);
+  r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  await r.poller.pollOnce();
+  assert.equal(r.events.length, 2);
+  // Other threads' rows push both keys out of the ring while this thread sits quiet, and the process restarts.
+  for (let n = 0; n < POLL_DEDUP_RING; n++) r.state.seenPollKey(`issue_comment:${100_000 + n}:2026-10-16T00:00:00Z`);
+  await r.state.flush();
+  const restarted = rig({ stateFile: file, github: r.github });
+  assert.ok(!restarted.state.snapshot().pollKeys.some((key) => key.startsWith('issue_comment:1:') || key.startsWith('issue_comment:3:')));
+
+  r.github.comments.get(channelId(ISSUE))!.push(comment(2, 7, '2026-10-20T00:00:00Z'));
+  r.github.threads.set(channelId(ISSUE), threadRow(ISSUE, { updatedAt: '2026-10-20T00:00:00Z' }));
+  r.github.notify(ISSUE, '2026-10-20T00:00:00Z');
+  r.github.lastModified = 'Tue, 20 Oct 2026 00:00:00 GMT';
+  const result = await restarted.poller.pollOnce();
+  assert.ok(r.github.calls.includes(`comments ${channelId(ISSUE)} since=2026-10-15T00:09:29Z`), 'the read takes its last second again');
+  assert.deepEqual(restarted.events.map((e) => e.id), ['poll:issue_comment:2:2026-10-20T00:00:00Z']);
+  assert.equal(result.duplicates, 2);
+});
+
 test('a pull request\'s review comments and reviews are read for it alone, since its cursor, with its title and the review\'s commit', async () => {
   const r = rig();
   r.github.threads.set(channelId(PULL), threadRow(PULL));
@@ -293,9 +324,14 @@ test('a pull request\'s review comments and reviews are read for it alone, since
   assert.equal(byId['poll:review_comment:40:2026-10-15T00:09:20Z']?.thread?.number, 12);
   const atW = byId['poll:review:50:2026-10-15T00:09:00Z'];
   assert.ok(atW, 'a review submitted in the second W names is read, not dropped');
+  assert.equal(atW.kind, 'review.submitted');
+  assert.equal(atW.actor.login, 'maintainer');
+  assert.equal(atW.review?.state, 'approved');
   assert.equal(atW.title, 'Fix it');
   assert.equal(atW.sha, 'reviewed-sha');
-  assert.equal(byId['poll:review:51:2026-10-15T00:09:25Z']?.sha, 'head-1', 'a review without a commit falls back to the head');
+  const noCommit = byId['poll:review:51:2026-10-15T00:09:25Z'];
+  assert.ok(noCommit, 'a review without a commit is read');
+  assert.equal(noCommit.sha, undefined, 'and carries no sha, since the poller reads no head');
 
   // A review that came in after the thread's row was read moves no cursor past the row's own update.
   r.github.reviews.get(channelId(PULL))!.push({ id: 52, author: MAINTAINER, body: 'later', state: 'commented', submittedAt: '2026-10-15T00:10:30Z', html_url: 'https://x/52' });
@@ -320,7 +356,7 @@ test('a cursor of another shape names nothing, and the thread is read as first s
 
 test('a cursor whose times aren\'t instants names nothing, and the pass goes on', async () => {
   const r = rig();
-  r.state.setPolledHead(`notif:${channelId(ISSUE)}`, ['not a time', '', 'issue:open:abc'].join('\u0000'));
+  r.state.setPolledHead(`notif:${channelId(ISSUE)}`, ['not a time', '', 'issue:open:abc', ''].join('\u0000'));
   r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
   r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:10Z')]);
   r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
@@ -331,7 +367,7 @@ test('a cursor whose times aren\'t instants names nothing, and the pass goes on'
 });
 
 test('a cursor whose seen isn\'t an instant, or whose since is only loosely a date, names nothing', async () => {
-  for (const value of [['2026-10-15T00:00:00Z', 'yesterday', 'issue:open:abc'], ['12', '', '']]) {
+  for (const value of [['2026-10-15T00:00:00Z', 'yesterday', 'issue:open:abc', ''], ['12', '', '', '']]) {
     const r = rig();
     r.state.setPolledHead(`notif:${channelId(ISSUE)}`, value.join('\u0000'));
     r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
@@ -436,7 +472,7 @@ test('a merge arrives as pull.closed with whoever merged it as the actor, so it 
 
   r.github.threads.set(
     channelId(PULL),
-    threadRow(PULL, { state: 'closed', updatedAt: '2026-10-15T00:10:20Z', closedAt: '2026-10-15T00:10:20Z', closedBy: MAINTAINER, headSha: undefined }),
+    threadRow(PULL, { state: 'closed', updatedAt: '2026-10-15T00:10:20Z', closedAt: '2026-10-15T00:10:20Z', closedBy: MAINTAINER }),
   );
   r.github.notify(PULL, '2026-10-15T00:10:20Z');
   r.github.lastModified = 'Wed, 15 Oct 2026 00:10:20 GMT';
@@ -462,25 +498,31 @@ test('a thread first seen arrives as closed only if it closed within its reach-b
   );
 });
 
-test('an edit to a closed issue is no second close; a close after a reopen is, seen or not', async () => {
-  const r = rig();
-  const closed = (at: string, partial: Partial<PolledIssue> = {}): PolledIssue => threadRow(ISSUE, { state: 'closed', updatedAt: at, closedAt: at, closedBy: MAINTAINER, ...partial });
-  const step = async (row: PolledIssue): Promise<void> => {
-    r.github.threads.set(channelId(ISSUE), row);
-    r.github.notify(ISSUE, row.updatedAt);
-    r.github.lastModified = new Date(Date.parse(row.updatedAt)).toUTCString();
-    await r.poller.pollOnce();
-  };
-  await step(threadRow(ISSUE));
-  await step(closed('2026-10-15T00:10:00Z'));
-  await step(closed('2026-10-15T00:10:00Z', { updatedAt: '2026-10-15T00:11:00Z', body: 'edited after closing' }));
-  await step(threadRow(ISSUE, { updatedAt: '2026-10-15T00:12:00Z', closedAt: '2026-10-15T00:10:00Z' }));
-  await step(closed('2026-10-15T00:13:00Z'));
-  // Reopened and closed again between two passes: no pass saw it open.
-  await step(closed('2026-10-15T00:15:00Z'));
-  assert.deepEqual(r.events.map((e) => e.kind), ['issue.closed', 'issue.edited', 'issue.closed', 'issue.closed']);
-  assert.equal(new Set(r.events.map((e) => e.id)).size, 4);
-});
+for (const [thread, kinds] of [
+  [ISSUE, ['issue.closed', 'issue.edited', 'issue.closed', 'issue.closed']],
+  // A reopened pull request arrives as nothing, but its close after that still comes.
+  [PULL, ['pull.closed', 'pull.closed', 'pull.closed']],
+] as const) {
+  test(`an edit to a closed ${thread.kind === 'pull' ? 'pull request' : 'issue'} is no second close; a close after a reopen is, seen or not`, async () => {
+    const r = rig();
+    const closed = (at: string, partial: Partial<PolledIssue> = {}): PolledIssue => threadRow(thread, { state: 'closed', updatedAt: at, closedAt: at, closedBy: MAINTAINER, ...partial });
+    const step = async (row: PolledIssue): Promise<void> => {
+      r.github.threads.set(channelId(thread), row);
+      r.github.notify(thread, row.updatedAt);
+      r.github.lastModified = new Date(Date.parse(row.updatedAt)).toUTCString();
+      await r.poller.pollOnce();
+    };
+    await step(threadRow(thread));
+    await step(closed('2026-10-15T00:10:00Z'));
+    await step(closed('2026-10-15T00:10:00Z', { updatedAt: '2026-10-15T00:11:00Z', body: 'edited after closing' }));
+    await step(threadRow(thread, { updatedAt: '2026-10-15T00:12:00Z', closedAt: '2026-10-15T00:10:00Z' }));
+    await step(closed('2026-10-15T00:13:00Z'));
+    // Reopened and closed again between two passes: no pass saw it open.
+    await step(closed('2026-10-15T00:15:00Z'));
+    assert.deepEqual(r.events.map((e) => e.kind), kinds);
+    assert.equal(new Set(r.events.map((e) => e.id)).size, kinds.length);
+  });
+}
 
 test('a refused comment beside a delivered close doesn\'t bring the close again', async () => {
   const r = rig();
@@ -488,7 +530,7 @@ test('a refused comment beside a delivered close doesn\'t bring the close again'
   r.github.notify(PULL, '2026-10-15T00:09:30Z');
   await r.poller.pollOnce();
 
-  const merged = threadRow(PULL, { state: 'closed', updatedAt: '2026-10-15T00:10:20Z', closedAt: '2026-10-15T00:10:20Z', closedBy: MAINTAINER, headSha: undefined });
+  const merged = threadRow(PULL, { state: 'closed', updatedAt: '2026-10-15T00:10:20Z', closedAt: '2026-10-15T00:10:20Z', closedBy: MAINTAINER });
   r.github.threads.set(channelId(PULL), merged);
   r.github.comments.set(channelId(PULL), [comment(60, 12, '2026-10-15T00:10:10Z')]);
   r.github.notify(PULL, '2026-10-15T00:10:20Z');
@@ -564,7 +606,10 @@ test('a thread that fails five passes in a row is dropped with one event on its 
   const notice = r.events[0];
   assert.equal(notice.kind, 'thread.read_failed');
   assert.equal(notice.thread?.number, 7);
-  assert.equal(notice.actor.login, 'github-mcpl');
+  assert.ok(
+    !tagsFor(notice, { botLogin: 'github-mcpl', maintainers: [] }).tags.includes('chat:from-self'),
+    'never from-self, even for a token whose account is named github-mcpl',
+  );
   assert.match(notice.body ?? '', /its last 5 attempts in a row failed \(the last: GitHub answered 502: Bad gateway\)/);
   assert.doesNotMatch(notice.body ?? '', /getPolledThread/, 'no adapter method names reach the agent');
 
@@ -589,6 +634,7 @@ test('a thread gone or out of reach is dropped at once, with its event, and W mo
   assert.deepEqual(r.events.map((e) => e.kind), ['thread.read_failed']);
   assert.match(r.events[0].body ?? '', /GitHub answered 404: Not Found, so the thread is gone or out of this token's reach/);
   assert.doesNotMatch(r.events[0].body ?? '', /passes|in a row/);
+  assert.doesNotMatch(r.events[0].body ?? '', /read tools/, 'the token can\'t reach the thread, so no read tool can either');
   assert.equal(r.state.notificationsWatermark().since, '2026-10-15T00:09:39Z');
 });
 
@@ -679,7 +725,7 @@ test('a failing thread keeps its place in the head memory while it waits, so its
   r.github.notify(ISSUE, '2026-10-15T00:09:45Z');
   r.github.lastModified = 'Wed, 15 Oct 2026 00:09:45 GMT';
   for (let n = 0; n < 150; n++) r.state.setPolledHead(`other#${n}`, 'x');
-  r.github.failing.set(channelId(ISSUE), new GitHubApiError(502, 'Bad gateway', 'listCommentsSince'));
+  r.github.failing.set(channelId(ISSUE), new GitHubApiError(502, 'Bad gateway', 'getPolledThread'));
   await r.poller.pollOnce();
   for (let n = 150; n < 300; n++) r.state.setPolledHead(`other#${n}`, 'x');
   assert.notEqual(r.state.polledHead(cursorKey), null, 'the failure rewrote its place');
@@ -745,7 +791,7 @@ test('a waiting thread\'s retry entry keeps its cursor, so its held rows come ev
   r.github.threads.set(channelId(ISSUE), threadRow(ISSUE, { updatedAt: '2026-10-15T00:09:50Z' }));
   r.github.notify(ISSUE, '2026-10-15T00:09:50Z');
   r.github.lastModified = 'Wed, 15 Oct 2026 00:09:50 GMT';
-  r.github.failing.set(channelId(ISSUE), new GitHubApiError(502, 'Bad gateway', 'listCommentsSince'));
+  r.github.failing.set(channelId(ISSUE), new GitHubApiError(502, 'Bad gateway', 'getPolledThread'));
   await r.poller.pollOnce();
   const [entry] = r.state.notificationRetries();
   assert.ok(entry?.cursor, 'the entry carries the cursor');
@@ -847,7 +893,7 @@ test('a stored cursor of another shape is logged as it is set aside', async () =
 // ─────────────────────────────────────────────────────────────────────────────
 // Restarts
 
-test('state is flushed as a pass goes, so a process that dies after it repeats nothing', async () => {
+test('state is flushed as a pass goes, so a process restarted after a pass repeats nothing', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'gh-notif-'));
   const file = join(dir, 'state.json');
   const r = rig({ stateFile: file });
@@ -873,20 +919,20 @@ test('state is flushed as a pass goes, so a process that dies after it repeats n
   assert.deepEqual(restarted.events, []);
 });
 
-test('each thread\'s state is flushed before the next thread is read', async () => {
-  const r = rig();
+test('each thread\'s state is on disk before the next thread is read', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-')), 'state.json');
+  const r = rig({ stateFile: file });
   const other: ThreadRef = { repo: REPO, number: 9, kind: 'issue' };
   r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
   r.github.threads.set(channelId(other), threadRow(other));
   r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
   r.github.notify(other, '2026-10-15T00:09:30Z');
-  const flushedAt: number[] = [];
-  const flush = r.state.flush.bind(r.state);
-  r.state.flush = async () => {
-    flushedAt.push(r.github.calls.length);
-    await flush();
+  let onDisk: string | null | undefined;
+  const readThread = r.github.getPolledThread.bind(r.github);
+  r.github.getPolledThread = async (thread) => {
+    if (channelId(thread) === channelId(other)) onDisk = GithubState.load(file).polledHead(`notif:${channelId(ISSUE)}`);
+    return readThread(thread);
   };
   await r.poller.pollOnce();
-  const secondThread = r.github.calls.findIndex((c) => c === `thread ${channelId(other)}`);
-  assert.ok(flushedAt.some((at) => at > 0 && at <= secondThread), 'a flush lands between the first thread\'s reads and the second\'s');
+  assert.ok(onDisk, 'the first thread\'s cursor was in the state file when the second thread was read');
 });

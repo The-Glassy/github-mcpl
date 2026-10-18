@@ -1688,6 +1688,25 @@ test('contributor mode authenticates every call with the user token, not an inst
   assert.ok(!r.logs.join('\n').includes(USER_TOKEN), 'the token leaked into a log line');
 });
 
+test('a classic token no pattern knows is still kept out of an error that quotes it', async () => {
+  // An older classic token is 40 hex characters with no prefix, so only the token the adapter holds can find it.
+  const hex = 'a3f9c1e07b2d4c5e8f6a1b2c3d4e5f6a7b8c9d0e';
+  const fake = new FakeGitHub();
+  fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 500, body: { message: `credential ${hex} could not be checked` } });
+  await fake.start();
+  after(() => fake.stop());
+  const file = join(mkdtempSync(join(tmpdir(), 'github-mcpl-token-')), 'token');
+  writeFileSync(file, `${hex}\n`, { mode: 0o600 });
+  const adapter = new GitHubAdapter(
+    readConfig({ GITHUB_TOKEN_FILE: file, GITHUB_REPOS: 'anima-research/rayforce', GITHUB_BOT_LOGIN: 'a-human' }),
+    { baseUrl: fake.baseUrl, sleep: async () => {} },
+  );
+  const err = await adapter.getIssue(ISSUE).then(() => null, (e: unknown) => e);
+  assert.ok(err instanceof GitHubApiError);
+  assert.equal(fake.for('GET /repos/anima-research/rayforce/issues/7')[0].headers.authorization, `token ${hex}`);
+  assert.ok(!err.message.includes(hex), err.message);
+});
+
 test('contributor mode answers getAuthenticatedBot from GET /user, not GET /app', async () => {
   const r = await tokenRig((fake) => {
     fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
@@ -1727,31 +1746,99 @@ test('contributor mode does not retry a 401: the token cannot be re-minted', asy
   assert.equal(calls, 1, 'App mode retries a 401 once; contributor mode has nothing to re-mint');
 });
 
-test('listReviewsSince reads every page and answers reviews submitted at or after the cursor, oldest first', async () => {
-  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
-  const page1 = Array.from({ length: 100 }, (_, i) => ({
-    id: 100 + i,
+/** A page of `pulls/12/reviews` as GitHub answers it: page 1 names the last page in its `Link` header. */
+function reviewPage(page: number, last: number, rows: unknown[]): Answer {
+  const url = (n: number) => `<https://api.github.com/repositories/1/pulls/12/reviews?per_page=100&page=${n}>`;
+  return { body: rows, headers: page === 1 && last > 1 ? { link: `${url(2)}; rel="next", ${url(last)}; rel="last"` } : {} };
+}
+
+function reviewRows(page: number, submittedAt: string, length = 100): unknown[] {
+  return Array.from({ length }, (_, i) => ({
+    id: page * 1000 + i,
     user: { login: 'human-one' },
-    body: 'old',
+    body: 'b',
     state: 'COMMENTED',
-    submitted_at: '2026-09-01T00:00:00Z',
-    html_url: `https://x/${100 + i}`,
+    submitted_at: submittedAt,
+    html_url: `https://x/${page * 1000 + i}`,
   }));
+}
+
+test('listReviewsSince reads back from the last page to the cursor and answers reviews submitted at or after it, oldest first', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
   const r = await tokenRig((fake) => {
-    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => ({
-      body:
-        req.query.page === '2'
-          ? [
-              { id: 2, user: { login: 'human-two' }, body: 'lgtm', state: 'APPROVED', submitted_at: '2026-10-03T00:00:00Z', html_url: 'https://x/2' },
-              { id: 1, user: { login: 'human-one' }, body: 'nit', state: 'COMMENTED', submitted_at: '2026-10-02T00:00:00Z', html_url: 'https://x/1' },
-            ]
-          : page1,
-    }));
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer =>
+      req.query.page === '2'
+        ? reviewPage(2, 2, [
+            { id: 2, user: { login: 'human-two' }, body: 'lgtm', state: 'APPROVED', submitted_at: '2026-10-03T00:00:00Z', html_url: 'https://x/2' },
+            { id: 1, user: { login: 'human-one' }, body: 'nit', state: 'COMMENTED', submitted_at: '2026-10-02T00:00:00Z', html_url: 'https://x/1' },
+          ])
+        : reviewPage(1, 2, reviewRows(1, '2026-10-02T00:00:00Z')),
+    );
   });
   const rows = await r.adapter.listReviewsSince(pull, '2026-10-02T00:00:00Z');
-  assert.deepEqual(rows.map((row) => row.id), [1, 2], 'the review in the cursor\'s own second is kept; the dedup ring drops a repeat');
-  assert.equal(rows[1].state, 'approved');
+  assert.equal(rows.length, 102, 'every page is new, so both are read');
+  assert.deepEqual(rows.slice(-2).map((row) => row.id), [1, 2], 'the review in the cursor\'s own second is kept; the poller drops a repeat');
+  assert.equal(rows[101].state, 'approved');
   assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((req) => req.query.page), ['1', '2']);
+});
+
+test('listReviewsSince costs a long history nothing: it reads page 1 and back from the last to the cursor, and caps only new reviews', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  // 30 pages of reviews, the last starting before the cursor: only page 1 and page 30 are read.
+  const long = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+      const page = Number(req.query.page);
+      if (page !== 30) return reviewPage(page, 30, reviewRows(page, '2026-09-01T00:00:00Z'));
+      return reviewPage(30, 30, [...reviewRows(30, '2026-09-30T00:00:00Z', 40), ...reviewRows(31, '2026-10-05T00:00:00Z', 2)]);
+    });
+  });
+  const rows = await long.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+  assert.deepEqual(rows.map((row) => row.id), [31000, 31001]);
+  assert.deepEqual(long.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((req) => req.query.page), ['1', '30']);
+
+  // A list on one page has no Link header: one request.
+  const one = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, { body: [...reviewRows(1, '2026-09-01T00:00:00Z', 3), ...reviewRows(2, '2026-10-05T00:00:00Z', 1)] });
+  });
+  assert.deepEqual((await one.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z')).map((row) => row.id), [2000]);
+  assert.equal(one.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 1);
+
+  // More than 20 pages holding new reviews is more than one read takes, and the read stops at the 21st page.
+  const busy = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer =>
+      reviewPage(Number(req.query.page), 22, reviewRows(Number(req.query.page), '2026-10-05T00:00:00Z')),
+    );
+  });
+  await assert.rejects(() => busy.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), ReadCapError);
+  assert.equal(busy.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 21, 'page 1 and twenty pages back');
+
+  // Exactly 21 pages: page 1 counts only if it holds a new review.
+  for (const [page1At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
+    const edge = await tokenRig((fake) => {
+      fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+        const page = Number(req.query.page);
+        return reviewPage(page, 21, reviewRows(page, page === 1 ? page1At : '2026-10-05T00:00:00Z'));
+      });
+    });
+    const read = edge.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+    if (fails) await assert.rejects(read, ReadCapError);
+    else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 1 is one read');
+  }
+});
+
+test('listReviewsSince fails a page that isn\'t a list, and a Link with a next page but no last', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const odd = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, { body: { message: 'not a list' } });
+  });
+  await assert.rejects(() => odd.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), /something other than a list/);
+  const byCursor = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, {
+      body: reviewRows(1, '2026-10-05T00:00:00Z'),
+      headers: { link: '<https://api.github.com/repositories/1/pulls/12/reviews?per_page=100&after=abc>; rel="next"' },
+    });
+  });
+  await assert.rejects(() => byCursor.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), /named a next page but no last page/);
 });
 
 test('listNotifications lists read threads too, since W, every page, with If-Modified-Since on the first page only', async () => {
@@ -1842,11 +1929,20 @@ test('listNotifications maps a subject into a repo, kind and number, and drops w
           subject: { type: 'Discussion', url: null, title: 'off-topic' },
           repository: { full_name: 'anima-research/rayforce' },
         },
+        {
+          id: '3',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'author',
+          unread: false,
+          subject: { type: 'PullRequest', url: 'https://api.github.com/repos/anima-research/rayforce/pulls/12', title: 'Fix it' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
       ],
     });
   });
   const page = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: null });
-  assert.equal(page.notifications.length, 1);
+  assert.equal(page.notifications.length, 2);
+  assert.deepEqual([page.notifications[1].kind, page.notifications[1].number], ['pull', 12]);
   assert.deepEqual(page.notifications[0], {
     id: '1',
     updatedAt: '2026-10-15T00:00:00Z',
@@ -1859,7 +1955,7 @@ test('listNotifications maps a subject into a repo, kind and number, and drops w
   });
 });
 
-test('getPolledThread reads the issues endpoint for state, close time and closer, and an open pull\'s head without its checks', async () => {
+test('getPolledThread reads only the issues endpoint: state, close time and closer, whether a pull request was merged, and no head', async () => {
   const pull = { repo: REPO, number: 12, kind: 'pull' as const };
   const r = await tokenRig((fake) => {
     fake.on('GET /repos/anima-research/rayforce/issues/12', {
@@ -1873,10 +1969,25 @@ test('getPolledThread reads the issues endpoint for state, close time and closer
         created_at: '2026-10-01T00:00:00Z',
         updated_at: '2026-10-15T00:00:00Z',
         html_url: 'https://github.com/anima-research/rayforce/pull/12',
-        pull_request: {},
+        pull_request: { merged_at: null },
       },
     });
-    fake.on('GET /repos/anima-research/rayforce/pulls/12', { body: { number: 12, head: { sha: 'head-1' } } });
+    fake.on('GET /repos/anima-research/rayforce/issues/14', {
+      body: {
+        id: 9014,
+        number: 14,
+        title: 'Fix more',
+        body: '',
+        state: 'closed',
+        user: { login: 'agent' },
+        created_at: '2026-10-01T00:00:00Z',
+        updated_at: '2026-10-15T00:00:00Z',
+        closed_at: '2026-10-15T00:00:00Z',
+        closed_by: { login: 'maintainer' },
+        html_url: 'https://github.com/anima-research/rayforce/pull/14',
+        pull_request: { merged_at: '2026-10-15T00:00:00Z' },
+      },
+    });
     fake.on('GET /repos/anima-research/rayforce/issues/7', {
       body: {
         id: 9007,
@@ -1895,11 +2006,15 @@ test('getPolledThread reads the issues endpoint for state, close time and closer
   });
   const open = await r.adapter.getPolledThread(pull);
   assert.equal(open.isPullRequest, true);
-  assert.equal(open.headSha, 'head-1');
+  assert.equal(open.headSha, undefined);
+  assert.equal(open.merged, false);
+  const merged = await r.adapter.getPolledThread({ repo: REPO, number: 14, kind: 'pull' });
+  assert.equal(merged.merged, true);
   const closed = await r.adapter.getPolledThread(ISSUE);
   assert.equal(closed.closedAt, '2026-10-15T00:00:00Z');
   assert.equal(closed.closedBy?.login, 'maintainer');
-  assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/commits/head-1/check-runs'), [], 'no check runs are read');
+  assert.equal(closed.merged, undefined, 'an issue says nothing of a merge');
+  assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12'), [], 'an open pull request\'s head is not read');
 });
 
 test('listCommentsSince and listPullReviewCommentsSince read one thread\'s rows since its cursor, every page', async () => {
@@ -1925,6 +2040,7 @@ test('listCommentsSince and listPullReviewCommentsSince read one thread\'s rows 
   assert.ok(reviewComments.every((c) => c.number === 12));
   const sent = r.fake.for('GET /repos/anima-research/rayforce/pulls/12/comments')[0].query;
   assert.deepEqual([sent.since, sent.sort, sent.direction], ['2026-10-14T00:00:00Z', 'updated', 'asc']);
+  assert.equal(r.fake.for('GET /repos/anima-research/rayforce/issues/7/comments')[0].query.since, '2026-10-14T00:00:00Z');
 });
 
 test('isLastingFailure: gone or out of reach is lasting; a rate limit, a server error or a network failure passes', () => {
@@ -2065,7 +2181,9 @@ test('a per-thread read takes exactly 2,000 rows whole, fails past them, and fai
   await assert.rejects(() => odd.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z'), /something other than a list/);
 });
 
-test('searchIssues drops every qualifier GitHub ORs with repo:, negated or not, so the search stays in the one repository', async () => {
+test('searchIssues drops every repo:, user:, org: and owner: qualifier, so the search stays in the one repository', async () => {
+  // A negated one goes too: an owner exclusion inside one repository excludes all of it or nothing, so
+  // dropping it loses no useful exclusion, and the scrub stays one pattern.
   for (const qualifier of ['repo:someone/else', 'user:someone', 'org:someone', 'owner:someone', '-user:someone', 'USER:someone']) {
     const r = await rig();
     await r.adapter.searchIssues(REPO, `is:open ${qualifier} flaky`);

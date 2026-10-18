@@ -407,7 +407,7 @@ test('a stored watermark or answer time that is only loosely a date is dropped o
 test('a retry entry keeps its cursor across a restart', () => {
   const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-state-'));
   const file = join(dir, 'state.json');
-  const cursor = ['2026-10-15T00:09:30Z', '2026-10-15T00:09:30Z', 'issue:open:abc'].join('\u0000');
+  const cursor = ['2026-10-15T00:09:30Z', '2026-10-15T00:09:30Z', 'issue:open:abc', 'issue_comment:5:2026-10-15T00:09:30Z'].join('\u0000');
   writeFileSync(
     file,
     JSON.stringify({

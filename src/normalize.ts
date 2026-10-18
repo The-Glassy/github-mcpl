@@ -51,10 +51,11 @@ export interface WebhookDelivery {
 }
 
 /**
- * Which `since` query a poll row came from. Part of the dedup key and of the
- * poll event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1).
- * `review` is contributor mode's notifications poller only: a submitted
- * review, which the repository poll never fetches.
+ * Which read a poll row came from. Part of the dedup key and of the poll
+ * event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1). Each is a
+ * `since` query but `review`, contributor mode's notifications poller only: a
+ * submitted review, from a list that takes no `since`, which the adapter
+ * filters by `submitted_at` itself. The repository poll never fetches one.
  */
 export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks' | 'review';
 
@@ -613,19 +614,19 @@ export function normalizePolledComment(
  * endpoint is a client-side filter the adapter applies itself). Same shape as
  * the webhook's `pull_request_review` case in {@link normalizeWebhook}: one
  * `review.submitted` event with the pull request's title, and the commit the
- * review was written against, falling back to the pull request's head where
- * the row has none, so a notification and a webhook delivery of the same
- * review tag and render alike.
+ * review was written against where the row names one. The poller reads no
+ * head, so a row without `commit_id` carries no sha, where the webhook would
+ * fall back to the head.
  */
 export function normalizePolledReview(
   repo: RepoRef,
   pull: ThreadRef,
   row: PolledReview,
   receivedAt: string,
-  pullRow: { title: string; headSha?: string },
+  title: string,
 ): NormalizedEvent {
   const key = pollKey('review', row.id, row.submittedAt);
-  const sha = row.commitId ?? pullRow.headSha;
+  const sha = row.commitId;
   return {
     id: pollEventId(key),
     receivedAt,
@@ -633,7 +634,7 @@ export function normalizePolledReview(
     kind: 'review.submitted',
     thread: pull,
     actor: row.author,
-    title: pullRow.title,
+    title,
     body: row.body,
     html_url: row.html_url,
     ...(sha === undefined ? {} : { sha }),
