@@ -1076,6 +1076,35 @@ test('a review request refused beside a skipped backlog waits on a retry entry, 
   assert.deepEqual(restarted.state.notificationRetries(), []);
 });
 
+test('a review request refused beside a backlog skipped on every pass is dropped after five passes, as any thread is', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.github.listReviewsSince = async () => {
+    throw new ReadCapError('listReviewsSince');
+  };
+  r.refuse.add('poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z');
+  const attempts: number[] = [];
+  for (let pass = 0; pass < 5; pass++) {
+    await r.poller.pollOnce();
+    attempts.push(...r.state.notificationRetries().map((x) => x.attempts));
+  }
+  assert.deepEqual(attempts, [1, 2, 3, 4], 'counted on each pass, and gone after the fifth');
+});
+
+test('a review request listed beside a thread read that meets GitHub\'s rate limit waits on its retry entry, and arrives next pass', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.github.failing.set(channelId(PULL), new GitHubApiError(429, 'Too Many Requests', 'getPolledThread'));
+  await r.poller.pollOnce();
+  assert.equal(r.events.length, 0);
+  assert.deepEqual(r.state.notificationRetries().map((x) => x.reviewRequest?.updatedAt), ['2026-10-15T00:09:30Z']);
+  r.github.failing.clear();
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z']);
+});
+
 test('a newer update of a thread\'s review_requested notification supersedes a request still waiting: one request arrives, the newest', async () => {
   const r = rig();
   r.github.threads.set(channelId(PULL), threadRow(PULL));
@@ -1124,11 +1153,10 @@ test('a settled failure on the head of the token user\'s own open pull request a
   assert.deepEqual(ci.checks, { conclusion: 'failure', failed: [{ name: 'test', url: 'https://ci/1' }] });
   assert.ok(tagsFor(ci, { botLogin: 'a-human', maintainers: [] }).tags.includes('github:ci=failure'));
 
-  // The next pass, a 304, looks again, reads no head while the pull request's update stands, and delivers nothing twice.
+  // The next pass, a 304, doesn't look again while the pull request's update stands: its result was delivered.
   const second = await r.poller.pollOnce();
   assert.equal(second.notModified, true);
-  assert.equal(second.checkLookups, 1);
-  assert.equal(second.duplicates, 1);
+  assert.equal(second.checkLookups, 0);
   assert.equal(r.github.calls.filter((c) => c.startsWith('head ')).length, 1);
   assert.equal(r.events.length, 1);
 
@@ -1142,6 +1170,37 @@ test('a settled failure on the head of the token user\'s own open pull request a
   r.github.checks.set('sha-two', { sha: 'sha-two', conclusion: 'success', total: 2, failed: [] });
   await r.poller.pollOnce();
   assert.deepEqual(r.events.slice(1).map((e) => [e.kind, e.sha, e.checks?.conclusion]), [['checks.completed', 'sha-two', 'success']]);
+});
+
+test('a delivered result isn\'t looked up again until ten minutes pass, so a re-run on an unmoved head arrives then', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  r.github.checks.set('sha-one', { sha: 'sha-one', conclusion: 'failure', total: 2, failed: [{ name: 'test', url: 'https://ci/1' }] });
+  await r.poller.pollOnce();
+  r.github.checks.set('sha-one', { sha: 'sha-one', conclusion: 'success', total: 2, failed: [] });
+  r.setNow('2026-10-15T00:19:59.000Z');
+  assert.equal((await r.poller.pollOnce()).checkLookups, 0);
+  r.setNow('2026-10-15T00:20:00.000Z');
+  assert.equal((await r.poller.pollOnce()).checkLookups, 1);
+  assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure', 'success'], 'the re-run\'s result, on the same head');
+  assert.equal(r.github.calls.filter((c) => c.startsWith('head ')).length, 2, 'its head read again with it');
+  // A known result once the head is read again counts as delivered too: not looked up again within ten minutes.
+  r.setNow('2026-10-15T00:25:00.000Z');
+  assert.equal((await r.poller.pollOnce()).checkLookups, 0);
+});
+
+test('a failed search for the token user\'s open pull requests looks up no checks, and the pass still moves the watermark', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.listOwnOpenPulls = async () => {
+    throw new GitHubApiError(502, 'Bad Gateway', 'listOwnOpenPulls');
+  };
+  r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+  const result = await r.poller.pollOnce();
+  assert.equal(result.checkLookups, 0);
+  assert.notEqual(r.state.notificationsWatermark().since, null, 'the listing\'s watermark was stored');
 });
 
 test('more own open pull requests than one pass looks up are taken in turns', async () => {
@@ -1185,7 +1244,7 @@ test('a head read stands while its pull request\'s update does, for ten minutes 
   assert.deepEqual(r.github.calls.filter((c) => c.startsWith('checks ')).slice(2), ['checks sha-two'], 'the head is read again, though its update stood');
 });
 
-test('a refused checks event arrives on the next pass; GitHub\'s rate limit ends a pass\'s lookups, and other failures skip one pull request', async () => {
+test('a refused checks event arrives when its pull request is next looked at; GitHub\'s rate limit ends a pass\'s lookups, and other failures skip one pull request', async () => {
   const r = rig({ login: 'a-human' });
   const second: ThreadRef = { repo: REPO, number: 13, kind: 'pull' };
   const third: ThreadRef = { repo: REPO, number: 14, kind: 'pull' };
@@ -1210,7 +1269,8 @@ test('a refused checks event arrives on the next pass; GitHub\'s rate limit ends
   await r.poller.pollOnce();
   assert.deepEqual(r.events.slice(2).map((e) => e.sha), ['sha-a']);
 
-  // A rate limit stops the lookups at once.
+  // A rate limit stops the lookups at once. A push moves the first pull request's update, so it's looked up again; the others' results stand.
+  r.github.ownPulls = [own('2026-10-15T00:10:00Z'), own('2026-10-15T00:08:00Z', second), own('2026-10-15T00:07:00Z', third)];
   r.github.checks.set('sha-a', new GitHubApiError(403, 'API rate limit exceeded for user ID 1.', 'getCheckRuns'));
   const before = r.github.calls.length;
   const limited = await r.poller.pollOnce();

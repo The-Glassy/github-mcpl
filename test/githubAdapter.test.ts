@@ -1814,14 +1814,14 @@ test('listReviewsSince costs a long history nothing: it reads page 1 and back fr
   assert.deepEqual((await one.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z')).map((row) => row.id), [2000]);
   assert.equal(one.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 1);
 
-  // More than 20 pages holding new reviews is more than one read takes, and the read stops at the 21st page.
+  // More than 20 pages holding new reviews is more than one read takes: the read stops at the 21st page back, the first past the cap that holds a new review.
   const busy = await tokenRig((fake) => {
     fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer =>
       reviewPage(Number(req.query.page), 22, reviewRows(Number(req.query.page), '2026-10-05T00:00:00Z')),
     );
   });
   await assert.rejects(() => busy.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), ReadCapError);
-  assert.equal(busy.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 21, 'page 1 and twenty pages back');
+  assert.equal(busy.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 22, 'page 1, twenty pages back, and the 21st page back, which holds a new review');
 
   // Exactly 21 pages: page 1 counts only if it holds a new review.
   for (const [page1At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
@@ -1835,6 +1835,20 @@ test('listReviewsSince costs a long history nothing: it reads page 1 and back fr
     if (fails) await assert.rejects(read, ReadCapError);
     else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 1 is one read');
   }
+
+  // The same edge with the old boundary on page 2 of 22: page 2 is read, and counts only if it holds a new review.
+  for (const [page2At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
+    const edge = await tokenRig((fake) => {
+      fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+        const page = Number(req.query.page);
+        return reviewPage(page, 22, reviewRows(page, page === 1 ? '2026-09-01T00:00:00Z' : page === 2 ? page2At : '2026-10-05T00:00:00Z'));
+      });
+    });
+    const read = edge.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+    if (fails) await assert.rejects(read, ReadCapError);
+    else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 2 is one read');
+    assert.equal(edge.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 22, 'page 1, twenty new pages and page 2');
+  }
 });
 
 test('listReviewsSince fails a page that isn\'t a list, and a Link with a next page but no last', async () => {
@@ -1842,7 +1856,11 @@ test('listReviewsSince fails a page that isn\'t a list, and a Link with a next p
   const odd = await tokenRig((fake) => {
     fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, { body: { message: 'not a list' } });
   });
-  await assert.rejects(() => odd.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), /something other than a list/);
+  await assert.rejects(
+    () => odd.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'),
+    (err: Error) => err.message === 'listReviewsSince: GitHub answered page 1 with something other than a list',
+    'the operation named once',
+  );
   const byCursor = await tokenRig((fake) => {
     fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, {
       body: reviewRows(1, '2026-10-05T00:00:00Z'),

@@ -11,7 +11,7 @@
  * **What a pass lists.** The watermark W is where the last listing got to. A
  * pass lists `GET /notifications?all=true&participating=true&since=W`, every
  * page, conditional on the last listing's `Last-Modified`, so an unchanged
- * inbox is a 304 that costs no rate limit. `all=true` lists read threads too,
+ * inbox's listing is a 304 that costs no rate limit. `all=true` lists read threads too,
  * so nothing depends on what anyone has marked read, and this ingress marks
  * nothing read. Threads in a repository outside GITHUB_REPOS are dropped: no
  * tool and no `channels/publish` would act there, and a user's other threads
@@ -32,9 +32,11 @@
  * `pull.review_requested` event too, keyed by the notification's id and
  * `updated_at`; one not yet delivered waits on its thread's retry entry,
  * since a later listing won't show it again. And each pass whose reads met no
- * rate limit looks up the checks on the head of each open pull request the
- * token's user authored ({@link NotificationsPoller.pollOwnChecks}), as App
- * mode's repository poll does for every open pull request it sees.
+ * rate limit, a 304's included, looks up the checks on the head of each open
+ * pull request the token's user authored whose result it hasn't delivered
+ * ({@link NotificationsPoller.pollOwnChecks}), since no notification says
+ * they finished. App mode's repository poll looks up the heads of the pull
+ * requests it saw move, until they settle.
  *
  * **A thread with no cursor** reads its rows from {@link NOTIFICATION_DELAY_MS}
  * before GitHub's previous answer to a listing, 304s included (before W, when
@@ -354,8 +356,12 @@ export class NotificationsPoller {
   private readonly onEvent: EventListener;
   private readonly logger: Logger;
   private readonly now: () => Date;
-  /** Each own open pull request's head as last read, with its `updated_at` then and when it was read, by channel. */
-  private readonly heads = new Map<string, { updatedAt: string; sha: string; readAt: number }>();
+  /**
+   * Each own open pull request's head as last read, with its `updated_at`
+   * then, when it was read, and whether its checks' finished result was
+   * delivered, by channel.
+   */
+  private readonly heads = new Map<string, { updatedAt: string; sha: string; readAt: number; settled: boolean }>();
   /** Where the next pass's check lookups start among the own open pull requests, when there are more than one pass looks up. */
   private checkTurn = 0;
   /** The last `X-Poll-Interval` the API reported, in ms. */
@@ -557,8 +563,8 @@ export class NotificationsPoller {
             result.delivered.push(...(await this.announceDrop(thread, outcome.failure, attempts, receivedAt)));
             // A skipped backlog leaves the thread readable from its current
             // update, so a review request refused beside it is read again with it.
-            if (outcome.failure.kind === 'backlog' && outcome.request) {
-              retries.set(channel, retryEntry(thread, attemptsSoFar, place, outcome.request));
+            if (outcome.failure.kind === 'backlog' && outcome.request && attempts < NOTIFICATION_RETRY_LIMIT) {
+              retries.set(channel, retryEntry(thread, attempts, place, outcome.request));
             }
           } else {
             retries.set(channel, retryEntry(thread, attempts, place, outcome.request));
@@ -730,8 +736,11 @@ export class NotificationsPoller {
    * or that read is {@link HEAD_READ_TTL_MS} old. A head whose runs
    * have all finished is a `checks.completed` event as App mode's repository
    * poll makes it, keyed by its sha, conclusion and failed jobs, so each
-   * result is delivered once and a re-run that changes it is news. A refused
-   * one isn't recorded, so the next pass, which looks again, delivers it.
+   * result is delivered once and a re-run that changes it is news. Once its
+   * result is delivered, a head isn't looked up again until its pull
+   * request's `updated_at` moves or its head read is {@link HEAD_READ_TTL_MS}
+   * old, so a re-run on an unmoved head arrives within that time. A refused
+   * one isn't recorded, so the pass that next looks at it delivers it.
    * GitHub's rate limit ends the lookups until the next pass; any other
    * failure skips that pull request this pass.
    */
@@ -770,8 +779,14 @@ export class NotificationsPoller {
       let summary: ChecksSummary;
       try {
         const known = this.heads.get(channel);
-        if (known === undefined || known.updatedAt !== pull.updatedAt || now - known.readAt >= HEAD_READ_TTL_MS) {
-          this.heads.set(channel, { updatedAt: pull.updatedAt, sha: await this.api.getPullHeadSha(thread), readAt: now });
+        const stands = known !== undefined && known.updatedAt === pull.updatedAt && now - known.readAt < HEAD_READ_TTL_MS;
+        if (stands && known.settled) {
+          // Its result was delivered and nothing moved: looked up again once its update moves or the head read is old.
+          tried += 1;
+          continue;
+        }
+        if (!stands) {
+          this.heads.set(channel, { updatedAt: pull.updatedAt, sha: await this.api.getPullHeadSha(thread), readAt: now, settled: false });
         }
         const sha = (this.heads.get(channel) as { sha: string }).sha;
         out.lookups += 1;
@@ -790,14 +805,16 @@ export class NotificationsPoller {
       if (!isCompletedSummary(summary)) continue;
       const event = normalizePolledChecks(pull.repo, thread, summary, pull.html_url, receivedAt);
       const key = ringKey(event);
+      const head = this.heads.get(channel) as { settled: boolean };
       if (alreadySeen.has(key)) {
         out.duplicates += 1;
+        head.settled = true;
         continue;
       }
       try {
         await this.onEvent(event);
       } catch (err) {
-        this.logger.warn('notifications: a checks event was refused; it is delivered when the next pass looks again', {
+        this.logger.warn('notifications: a checks event was refused; it is delivered when its pull request\'s turn comes again', {
           key,
           error: err instanceof Error ? err.message : String(err),
         });
@@ -805,6 +822,7 @@ export class NotificationsPoller {
       }
       this.state.seenPollKey(key);
       alreadySeen.add(key);
+      head.settled = true;
       out.delivered.push(event);
     }
     this.checkTurn = start + tried;

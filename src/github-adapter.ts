@@ -361,7 +361,7 @@ export interface OwnPull {
   /** The GITHUB_REPOS entry it is in, as configured. */
   repo: RepoRef;
   number: number;
-  /** Its `updated_at`, which a push moves, so an unchanged one says its head hasn't moved either. */
+  /** Its `updated_at`, which a push moves. The search's can lag a push, so an unchanged one says its head hasn't moved only for a while. */
   updatedAt: string;
   html_url: string;
 }
@@ -1699,7 +1699,8 @@ export class GitHubAdapter implements GitHubApi {
           per_page: 100,
           page,
         });
-        if (!Array.isArray(res.data)) throw new GitHubApiError(0, `GitHub answered page ${page} with something other than a list`, 'listReviewsSince');
+        // A plain Error: call() names the operation once.
+        if (!Array.isArray(res.data)) throw new Error(`GitHub answered page ${page} with something other than a list`);
         return { rows: res.data as ApiReview[], last: lastPageOf((res.headers as Record<string, string | undefined>).link) };
       });
     const first = await read(1);
@@ -1710,8 +1711,9 @@ export class GitHubAdapter implements GitHubApi {
     let rows: ApiReview[] = [];
     let page = last;
     while (page > 1) {
-      if (last - page >= THREAD_MAX_PAGES) throw new ReadCapError('listReviewsSince');
       const batch = (await read(page)).rows;
+      // Past the cap, a page counts only if it holds a new review too, as page 1 does below.
+      if (last - page >= THREAD_MAX_PAGES && batch.some((row) => submitted(row) >= sinceMs)) throw new ReadCapError('listReviewsSince');
       rows = [...batch, ...rows];
       if (batch.some((row) => submitted(row) < sinceMs)) break;
       page -= 1;
@@ -1741,7 +1743,8 @@ export class GitHubAdapter implements GitHubApi {
     for (let page = 1; ; page++) {
       const batch = await this.call(operation, async () => {
         const res = await fetchPage(page);
-        if (!Array.isArray(res.data)) throw new GitHubApiError(0, `GitHub answered page ${page} with something other than a list`, operation);
+        // A plain Error: call() names the operation once.
+        if (!Array.isArray(res.data)) throw new Error(`GitHub answered page ${page} with something other than a list`);
         return res.data as T[];
       });
       if (page > THREAD_MAX_PAGES) {
@@ -1798,7 +1801,8 @@ export class GitHubAdapter implements GitHubApi {
         pull_number: pull.number,
       });
       const sha = (res.data as ApiPull).head?.sha ?? '';
-      if (!sha) throw new GitHubApiError(0, 'GitHub answered with no head sha', 'getPullHeadSha');
+      // A plain Error: call() names the operation once.
+      if (!sha) throw new Error('GitHub answered with no head sha');
       return sha;
     });
   }

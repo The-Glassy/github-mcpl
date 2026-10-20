@@ -371,13 +371,20 @@ test('a notifications watermark that does not read as an instant is dropped on l
           { owner: 'o', name: '', number: 4, kind: 'issue', attempts: 0 },
           { owner: 'o', name: 'n', number: 5, kind: 'issue', attempts: 0, cursor: 7 },
           { owner: 'o', name: 'n', number: 3, kind: 'pull', attempts: -1000 },
+          { owner: 'o', name: 'n', number: 6, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-6', updatedAt: '2026-10-15T00:09:00Z' } },
+          { owner: 'o', name: 'n', number: 7, kind: 'pull', attempts: 0, reviewRequest: null },
+          { owner: 'o', name: 'n', number: 8, kind: 'pull', attempts: 0, reviewRequest: { id: '', updatedAt: '2026-10-15T00:09:00Z' } },
+          { owner: 'o', name: 'n', number: 9, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-9', updatedAt: 'not a time' } },
         ],
       },
     }),
   );
   const state = GithubState.load(file);
   assert.deepEqual(state.notificationsWatermark(), { since: null, lastModified: null, answeredAt: null });
-  assert.deepEqual(state.notificationRetries(), [{ owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2 }]);
+  assert.deepEqual(state.notificationRetries(), [
+    { owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2 },
+    { owner: 'o', name: 'n', number: 6, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-6', updatedAt: '2026-10-15T00:09:00Z' } },
+  ]);
 });
 
 test('a state file from before the retry list loads with an empty one, its watermark kept', () => {
