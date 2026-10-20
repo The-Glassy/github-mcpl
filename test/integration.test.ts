@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test, type TestContext } from 'node:test';
 import { method, type PushEventParams } from '@animalabs/mcpl-core';
-import { CheckGate, normalizePolledIssue, normalizeWebhook } from '../src/normalize.js';
+import { CheckGate, normalizeNotifiedReviewRequest, normalizePolledIssue, normalizeWebhook } from '../src/normalize.js';
 import { Poller } from '../src/poller.js';
 import { GithubState } from '../src/state.js';
 import { WebhookListener } from '../src/webhook.js';
@@ -590,6 +590,32 @@ test('a polled merge reaches the host as github:pr=merged beside github:pr=close
   await deliver('pull_request', fixture('pull_request.closed.json'), 'merge-webhook-1');
   await until(() => pushes(h).length === 3, 'the webhook merge');
   assert.ok((pushes(h)[2]?.tags ?? []).includes('github:pr=merged'));
+});
+
+test('a review request from a notification reaches the host as github:pr=review_requested with isReviewRequested, as a webhook\'s does', async (t) => {
+  const api = new FakeGitHubApi();
+  api.seedPullRequest({ number: 58 });
+  const h = rig(t, { api });
+  await initialize(h, true);
+  await grant(h);
+  const row: PolledIssue = {
+    id: 5800,
+    number: 58,
+    isPullRequest: true,
+    title: 'Fix it',
+    body: '',
+    state: 'open',
+    author: { login: 'octocat', isBot: false },
+    createdAt: '2026-10-01T00:00:00Z',
+    updatedAt: '2026-10-13T12:00:00Z',
+    html_url: `https://github.com/${TEST_REPO.owner}/${TEST_REPO.name}/pull/58`,
+  };
+  const event = normalizeNotifiedReviewRequest(TEST_REPO, row, { id: '9001', updatedAt: '2026-10-13T12:00:20Z' }, '2026-10-13T12:01:00.000Z');
+  await h.server.onEvent(event);
+  await until(() => pushes(h).length === 1, 'the review request');
+  assert.ok((pushes(h)[0]?.tags ?? []).includes('github:pr=review_requested'));
+  const metadata = (pushes(h)[0].origin as { metadata: Record<string, unknown> }).metadata;
+  assert.equal(metadata.isReviewRequested, true, 'the notification names no reviewer, and its reason says it is the token user');
 });
 
 /** The `origin` a webhook issue delivery produces, for the shape comparison. */

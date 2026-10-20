@@ -27,6 +27,15 @@
  * tags, metadata and channel the repository poll's would; the poller's own
  * `thread.read_failed` notice is built here.
  *
+ * **Two things a thread's rows don't show.** A listed pull request whose
+ * notification gives `review_requested` as its reason is a
+ * `pull.review_requested` event too, keyed by the notification's id and
+ * `updated_at`; one not yet delivered waits on its thread's retry entry,
+ * since a later listing won't show it again. And each pass whose reads met no
+ * rate limit looks up the checks on the head of each open pull request the
+ * token's user authored ({@link NotificationsPoller.pollOwnChecks}), as App
+ * mode's repository poll does for every open pull request it sees.
+ *
  * **A thread with no cursor** reads its rows from {@link NOTIFICATION_DELAY_MS}
  * before GitHub's previous answer to a listing, 304s included (before W, when
  * GitHub hasn't answered yet). A new thread wasn't in that answer, so what's
@@ -71,11 +80,15 @@
  */
 
 import {
+  isCompletedSummary,
+  normalizeNotifiedReviewRequest,
+  normalizePolledChecks,
   normalizePolledComment,
   normalizePolledIssue,
   normalizePolledReview,
   polledMarker,
 } from './normalize.js';
+import { MAX_CHECKED_PULLS_PER_POLL } from './poller.js';
 import {
   MIN_POLL_INTERVAL_MS,
   NOTIFICATION_RETRY_LIMIT,
@@ -83,6 +96,7 @@ import {
   isIsoInstant,
   repoAllowed,
   silentLogger,
+  type ChecksSummary,
   type EventActor,
   type Logger,
   type NormalizedEvent,
@@ -95,7 +109,14 @@ import {
   type ThreadRef,
 } from './types.js';
 import type { EventListener } from './webhook.js';
-import { ReadCapError, describeFailure, isLastingFailure, isRateLimit, type NotificationsPage } from './github-adapter.js';
+import {
+  ReadCapError,
+  describeFailure,
+  isLastingFailure,
+  isRateLimit,
+  type NotificationsPage,
+  type OwnPull,
+} from './github-adapter.js';
 
 /** The adapter surface this ingress uses. A structural subset — `GitHubAdapter` satisfies it with no cast. */
 export interface NotificationsPollerApi {
@@ -104,6 +125,9 @@ export interface NotificationsPollerApi {
   listCommentsSince(thread: ThreadRef, since: string): Promise<PolledComment[]>;
   listPullReviewCommentsSince(pull: ThreadRef, since: string): Promise<PolledComment[]>;
   listReviewsSince(pull: ThreadRef, since: string): Promise<PolledReview[]>;
+  listOwnOpenPulls(login: string, repos: readonly RepoRef[]): Promise<OwnPull[]>;
+  getPullHeadSha(pull: ThreadRef): Promise<string>;
+  getCheckRuns(repo: RepoRef, sha: string): Promise<ChecksSummary>;
 }
 
 /** The durable state this ingress needs; `state.ts`'s `GithubState` satisfies it with no adapter. */
@@ -126,6 +150,8 @@ export interface NotificationsPollerOptions {
   intervalMs: number;
   /** GITHUB_REPOS. A notification from any other repository is dropped. */
   repos: readonly RepoRef[];
+  /** The token's login: whose open pull requests have their checks looked up. Without it, none are. */
+  login?: string;
   onEvent: EventListener;
   logger?: Logger;
   /** Overridable in tests. */
@@ -148,6 +174,8 @@ export interface NotificationsPollResult {
   dropped: number;
   /** True when the listing stopped at its page cap, so some threads updated since W weren't listed. */
   truncated: boolean;
+  /** `getCheckRuns` calls on the heads of the token user's open pull requests; never above {@link MAX_CHECKED_PULLS_PER_POLL}. */
+  checkLookups: number;
 }
 
 /**
@@ -262,14 +290,24 @@ interface Candidate {
 /** The thread a retry entry names. */
 const retryThread = (r: NotificationRetry): ThreadRef => ({ repo: { owner: r.owner, name: r.name }, number: r.number, kind: r.kind });
 
-/** A retry entry for a thread: the passes it has failed in a row, and its cursor, so eviction from the head memory can't lose its place. */
-const retryEntry = (thread: ThreadRef, attempts: number, cursor: string | null): NotificationRetry => ({
+/**
+ * A retry entry for a thread: the passes it has failed in a row, its cursor,
+ * so eviction from the head memory can't lose its place, and a review request
+ * not yet delivered.
+ */
+const retryEntry = (
+  thread: ThreadRef,
+  attempts: number,
+  cursor: string | null,
+  reviewRequest?: { id: string; updatedAt: string },
+): NotificationRetry => ({
   owner: thread.repo.owner,
   name: thread.repo.name,
   number: thread.number,
   kind: thread.kind,
   attempts,
   ...(cursor === null ? {} : { cursor }),
+  ...(reviewRequest === undefined ? {} : { reviewRequest }),
 });
 
 /** A thread whose new rows are more than one read takes, with its row as read, so its cursor can move to its current update. */
@@ -297,6 +335,13 @@ interface ThreadFailure {
  */
 const SERVER_ACTOR: EventActor = { login: 'github-mcpl[server]', isBot: true };
 
+/**
+ * How long a pull request's head, as last read, stands while its `updated_at`
+ * does: GitHub's stamps are whole seconds, and the search's can lag a push,
+ * so an unchanged one doesn't prove the head unmoved for long.
+ */
+export const HEAD_READ_TTL_MS = 10 * 60_000;
+
 /** The longest delay setTimeout keeps; a longer one fires after a millisecond. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
@@ -305,9 +350,14 @@ export class NotificationsPoller {
   private readonly state: NotificationsIngressState;
   private readonly configuredIntervalMs: number;
   private readonly repos: readonly RepoRef[];
+  private readonly login: string;
   private readonly onEvent: EventListener;
   private readonly logger: Logger;
   private readonly now: () => Date;
+  /** Each own open pull request's head as last read, with its `updated_at` then and when it was read, by channel. */
+  private readonly heads = new Map<string, { updatedAt: string; sha: string; readAt: number }>();
+  /** Where the next pass's check lookups start among the own open pull requests, when there are more than one pass looks up. */
+  private checkTurn = 0;
   /** The last `X-Poll-Interval` the API reported, in ms. */
   private serverIntervalMs = 0;
   private timer: NodeJS.Timeout | undefined;
@@ -319,6 +369,7 @@ export class NotificationsPoller {
     this.state = opts.state;
     this.configuredIntervalMs = opts.intervalMs;
     this.repos = opts.repos;
+    this.login = opts.login ?? '';
     this.onEvent = opts.onEvent;
     this.logger = opts.logger ?? silentLogger();
     this.now = opts.now ?? (() => new Date());
@@ -432,6 +483,7 @@ export class NotificationsPoller {
       failed: 0,
       dropped: 0,
       truncated: page.truncated,
+      checkLookups: 0,
     };
 
     // The threads to read: first those a past pass failed on, so a busy
@@ -451,11 +503,23 @@ export class NotificationsPoller {
     }
     this.state.setNotificationRetries([...retries.values()]);
     const toRead = new Map<string, ThreadRef>();
-    for (const [channel, retry] of retries) toRead.set(channel, retryThread(retry));
+    // The review requests to deliver, by channel: those a retry entry kept,
+    // since a later listing won't show them again, and those listed now. A
+    // thread has one notification, so a newer update of it with the same
+    // reason supersedes a request still waiting: it says the same thing.
+    const requests = new Map<string, { id: string; updatedAt: string }>();
+    for (const [channel, retry] of retries) {
+      toRead.set(channel, retryThread(retry));
+      if (retry.reviewRequest) requests.set(channel, retry.reviewRequest);
+    }
     for (const n of page.notifications) {
       const thread: ThreadRef = { repo: n.repo, number: n.number, kind: n.kind };
-      if (!repoAllowed(n.repo, this.repos)) result.outOfScope += 1;
-      else if (!toRead.has(channelId(thread))) toRead.set(channelId(thread), thread);
+      if (!repoAllowed(n.repo, this.repos)) {
+        result.outOfScope += 1;
+        continue;
+      }
+      if (!toRead.has(channelId(thread))) toRead.set(channelId(thread), thread);
+      if (n.reason === 'review_requested' && n.kind === 'pull') requests.set(channelId(thread), { id: n.id, updatedAt: n.updatedAt });
     }
     result.threads = toRead.size;
 
@@ -465,13 +529,14 @@ export class NotificationsPoller {
     for (const [channel, thread] of toRead) {
       const waiting = retries.get(channel);
       const attemptsSoFar = waiting?.attempts ?? 0;
+      const request = requests.get(channel);
       if (rateLimited > 0) {
         // GitHub's rate limit ended this pass's reads: the rest wait for the next, uncounted.
-        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null)));
+        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null), request));
         rateLimited += 1;
         continue;
       }
-      const outcome = await this.pollThread(thread, reachFrom, receivedAt, alreadySeen, waiting?.cursor ?? null);
+      const outcome = await this.pollThread(thread, reachFrom, receivedAt, alreadySeen, waiting?.cursor ?? null, request);
       result.delivered.push(...outcome.delivered);
       result.duplicates += outcome.duplicates;
       if (outcome.failure === null) {
@@ -483,15 +548,20 @@ export class NotificationsPoller {
           rateLimited = 1;
           // To the back of the list, so the thread that met the limit can't keep the rest waiting.
           retries.delete(channel);
-          retries.set(channel, retryEntry(thread, attemptsSoFar, place));
+          retries.set(channel, retryEntry(thread, attemptsSoFar, place, outcome.request));
         } else {
           const attempts = attemptsSoFar + 1;
           if (outcome.failure.kind !== 'failed' || attempts >= NOTIFICATION_RETRY_LIMIT) {
             retries.delete(channel);
             result.dropped += 1;
             result.delivered.push(...(await this.announceDrop(thread, outcome.failure, attempts, receivedAt)));
+            // A skipped backlog leaves the thread readable from its current
+            // update, so a review request refused beside it is read again with it.
+            if (outcome.failure.kind === 'backlog' && outcome.request) {
+              retries.set(channel, retryEntry(thread, attemptsSoFar, place, outcome.request));
+            }
           } else {
-            retries.set(channel, retryEntry(thread, attempts, place));
+            retries.set(channel, retryEntry(thread, attempts, place, outcome.request));
           }
         }
       }
@@ -504,6 +574,11 @@ export class NotificationsPoller {
       this.logger.warn('notifications: GitHub rate-limited a read, so this pass read no further; those threads are read next pass', {
         threads: rateLimited,
       });
+    } else {
+      const checks = await this.pollOwnChecks(receivedAt, alreadySeen);
+      result.delivered.push(...checks.delivered);
+      result.duplicates += checks.duplicates;
+      result.checkLookups = checks.lookups;
     }
 
     const next = page.notModified ? since : nextWatermark(page, since);
@@ -538,7 +613,14 @@ export class NotificationsPoller {
     receivedAt: string,
     alreadySeen: Set<string>,
     held: string | null,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; failure: ThreadFailure | null }> {
+    request: { id: string; updatedAt: string } | undefined,
+  ): Promise<{
+    delivered: NormalizedEvent[];
+    duplicates: number;
+    failure: ThreadFailure | null;
+    /** The review request still to deliver, when it wasn't. */
+    request?: { id: string; updatedAt: string };
+  }> {
     const channel = channelId(thread);
     const cursorKey = `notif:${channel}`;
     // The head memory's cursor, or the one its retry entry kept if that was evicted.
@@ -552,33 +634,6 @@ export class NotificationsPoller {
     // are whole seconds, and a row written in the second the cursor names may
     // have come after the read that set it.
     const since = cursor.since === null ? firstReadSince(reachFrom) : isoSeconds(ms(cursor.since) - 1000);
-
-    let read: { rows: Candidate[]; state: Candidate | null; row: PolledIssue };
-    try {
-      read = await this.readThread(thread, since, cursor, receivedAt);
-    } catch (err) {
-      if (err instanceof BacklogTooLarge) {
-        // The same read would meet the same cap again: read the thread from its current update on.
-        this.state.setPolledHead(cursorKey, packCursor({ ...cursor, since: err.row.updatedAt }));
-        this.logger.warn('notifications poll: a thread has more new activity than one read takes; it is read from its current update on', {
-          channel,
-        });
-        return {
-          delivered: [],
-          duplicates: 0,
-          failure: { kind: 'backlog', cause: 'it had more than 2,000 comments or reviews to read at once' },
-        };
-      }
-      const kind = isLastingFailure(err) ? 'lasting' : isRateLimit(err) ? 'rate-limit' : 'failed';
-      this.logger.warn(
-        kind === 'lasting'
-          ? 'notifications poll: a thread is gone or out of reach'
-          : 'notifications poll: reading a thread failed; it is read again next pass',
-        { channel, error: err instanceof Error ? err.message : String(err) },
-      );
-      this.holdPlace(thread, reachFrom, held);
-      return { delivered: [], duplicates: 0, failure: { kind, cause: describeFailure(err) } };
-    }
 
     const delivered: NormalizedEvent[] = [];
     let duplicates = 0;
@@ -604,9 +659,46 @@ export class NotificationsPoller {
       return refusal;
     };
 
+    const requestEvent = (row: PolledIssue): Candidate[] =>
+      request ? [{ event: normalizeNotifiedReviewRequest(thread.repo, row, request, receivedAt), at: request.updatedAt }] : [];
+
+    let read: { rows: Candidate[]; state: Candidate | null; row: PolledIssue };
+    try {
+      read = await this.readThread(thread, since, cursor, receivedAt);
+    } catch (err) {
+      if (err instanceof BacklogTooLarge) {
+        // The same read would meet the same cap again: read the thread from its current update on.
+        this.state.setPolledHead(cursorKey, packCursor({ ...cursor, since: err.row.updatedAt }));
+        this.logger.warn('notifications poll: a thread has more new activity than one read takes; it is read from its current update on', {
+          channel,
+        });
+        // A review request isn't one of the rows skipped: it still arrives,
+        // and one refused waits on a retry entry of its own.
+        const refused = await deliver(requestEvent(err.row));
+        return {
+          delivered,
+          duplicates,
+          failure: { kind: 'backlog', cause: 'it had more than 2,000 comments or reviews to read at once' },
+          ...(request && refused !== null ? { request } : {}),
+        };
+      }
+      const kind = isLastingFailure(err) ? 'lasting' : isRateLimit(err) ? 'rate-limit' : 'failed';
+      this.logger.warn(
+        kind === 'lasting'
+          ? 'notifications poll: a thread is gone or out of reach'
+          : 'notifications poll: reading a thread failed; it is read again next pass',
+        { channel, error: err instanceof Error ? err.message : String(err) },
+      );
+      this.holdPlace(thread, reachFrom, held);
+      return { delivered: [], duplicates: 0, failure: { kind, cause: describeFailure(err) }, ...(request ? { request } : {}) };
+    }
+
     read.rows.sort((a, b) => (a.at === b.at ? a.event.id.localeCompare(b.event.id) : ms(a.at) - ms(b.at)));
     const rowsRefused = await deliver(read.rows);
     const stateRefused = read.state ? await deliver([read.state]) : null;
+    // A review request comes with no row of the thread's, so it neither moves
+    // nor holds the cursor: one refused waits on the retry entry instead.
+    const requestRefused = await deliver(requestEvent(read.row));
 
     const through = rowsRefused === null && stateRefused === null;
     // The rows the next read takes again, from a second before its since: every
@@ -621,12 +713,103 @@ export class NotificationsPoller {
         edge: through ? read.rows.filter((row) => ms(row.at) >= edgeFrom).map((row) => ringKey(row.event)) : cursor.edge,
       }),
     );
-    const failure = rowsRefused ?? stateRefused;
+    const failure = rowsRefused ?? stateRefused ?? requestRefused;
     return {
       delivered,
       duplicates,
       failure: failure === null ? null : { kind: 'failed', cause: `the host refused one of its events (${failure})` },
+      ...(request && requestRefused !== null ? { request } : {}),
     };
+  }
+
+  /**
+   * The checks on the head of each open pull request the token's user
+   * authored in GITHUB_REPOS: one search, then for each, up to
+   * {@link MAX_CHECKED_PULLS_PER_POLL} a pass in turns, one `getCheckRuns`,
+   * with a read of its head first when its `updated_at` moved since the last,
+   * or that read is {@link HEAD_READ_TTL_MS} old. A head whose runs
+   * have all finished is a `checks.completed` event as App mode's repository
+   * poll makes it, keyed by its sha, conclusion and failed jobs, so each
+   * result is delivered once and a re-run that changes it is news. A refused
+   * one isn't recorded, so the next pass, which looks again, delivers it.
+   * GitHub's rate limit ends the lookups until the next pass; any other
+   * failure skips that pull request this pass.
+   */
+  private async pollOwnChecks(
+    receivedAt: string,
+    alreadySeen: Set<string>,
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number }> {
+    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0 };
+    if (!this.login) return out;
+    let pulls: OwnPull[];
+    try {
+      pulls = await this.api.listOwnOpenPulls(this.login, this.repos);
+    } catch (err) {
+      this.logger.warn('notifications: listing the token user\'s open pull requests failed; their checks are looked up next pass', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return out;
+    }
+    const open = new Set(pulls.map((pull) => channelId({ repo: pull.repo, number: pull.number, kind: 'pull' })));
+    for (const channel of this.heads.keys()) if (!open.has(channel)) this.heads.delete(channel);
+    // Taken in turns, each pass starting where the last stopped, so none
+    // waits for good behind the cap or a rate limit.
+    const start = pulls.length === 0 ? 0 : this.checkTurn % pulls.length;
+    const due = [...pulls.slice(start), ...pulls.slice(0, start)].slice(0, MAX_CHECKED_PULLS_PER_POLL);
+    let tried = 0;
+    if (pulls.length > MAX_CHECKED_PULLS_PER_POLL) {
+      this.logger.info('notifications: more open pull requests than one pass looks up checks for; the rest wait their turn', {
+        cap: MAX_CHECKED_PULLS_PER_POLL,
+        open: pulls.length,
+      });
+    }
+    const now = this.now().getTime();
+    for (const pull of due) {
+      const thread: ThreadRef = { repo: pull.repo, number: pull.number, kind: 'pull' };
+      const channel = channelId(thread);
+      let summary: ChecksSummary;
+      try {
+        const known = this.heads.get(channel);
+        if (known === undefined || known.updatedAt !== pull.updatedAt || now - known.readAt >= HEAD_READ_TTL_MS) {
+          this.heads.set(channel, { updatedAt: pull.updatedAt, sha: await this.api.getPullHeadSha(thread), readAt: now });
+        }
+        const sha = (this.heads.get(channel) as { sha: string }).sha;
+        out.lookups += 1;
+        summary = await this.api.getCheckRuns(pull.repo, sha);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        if (isRateLimit(err)) {
+          this.logger.warn('notifications: GitHub rate-limited a check lookup, so this pass looked up no more', { channel, error });
+          break;
+        }
+        tried += 1;
+        this.logger.warn('notifications: looking up a pull request\'s checks failed; it is looked up again next pass', { channel, error });
+        continue;
+      }
+      tried += 1;
+      if (!isCompletedSummary(summary)) continue;
+      const event = normalizePolledChecks(pull.repo, thread, summary, pull.html_url, receivedAt);
+      const key = ringKey(event);
+      if (alreadySeen.has(key)) {
+        out.duplicates += 1;
+        continue;
+      }
+      try {
+        await this.onEvent(event);
+      } catch (err) {
+        this.logger.warn('notifications: a checks event was refused; it is delivered when the next pass looks again', {
+          key,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+      this.state.seenPollKey(key);
+      alreadySeen.add(key);
+      out.delivered.push(event);
+    }
+    this.checkTurn = start + tried;
+    await this.state.flush();
+    return out;
   }
 
   /**

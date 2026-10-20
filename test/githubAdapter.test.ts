@@ -1716,21 +1716,32 @@ test('contributor mode answers getAuthenticatedBot from GET /user, not GET /app'
   assert.equal(r.fake.for('GET /user')[0].headers.authorization, `token ${USER_TOKEN}`);
 });
 
-test('tokenLoginProblem names the login to set when GITHUB_BOT_LOGIN isn\'t the token\'s, spelled exactly', async () => {
+test('checkTokenLogin names the login to set when GITHUB_BOT_LOGIN isn\'t the token\'s, spelled exactly', async () => {
   const r = await tokenRig((fake) => {
     fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
   });
-  assert.equal(await r.adapter.tokenLoginProblem('a-human'), null);
-  const problem = await r.adapter.tokenLoginProblem('A-Human');
-  assert.match(problem ?? '', /set GITHUB_BOT_LOGIN to "a-human", spelled exactly so/);
+  assert.deepEqual(await r.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
+  const checked = await r.adapter.checkTokenLogin('A-Human');
+  assert.equal(checked.login, null);
+  assert.match(checked.problem ?? '', /set GITHUB_BOT_LOGIN to "a-human", spelled exactly so, or leave it unset/);
 });
 
-test('tokenLoginProblem lets a start go on when GitHub can\'t be reached, and says it checked nothing', async () => {
+test('checkTokenLogin takes an unset GITHUB_BOT_LOGIN from GET /user', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
+  });
+  assert.deepEqual(await r.adapter.checkTokenLogin(''), { login: 'a-human', problem: null });
+});
+
+test('checkTokenLogin lets a start go on when GitHub can\'t be reached and the login is set, and says it checked nothing; unset, it can\'t', async () => {
   const r = await tokenRig((fake) => {
     fake.on('GET /user', { status: 503, body: { message: 'unavailable' } });
   });
-  assert.equal(await r.adapter.tokenLoginProblem('a-human'), null);
+  assert.deepEqual(await r.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
   assert.ok(r.logs.some((line) => line.includes('GITHUB_BOT_LOGIN is unchecked')));
+  const unset = await r.adapter.checkTokenLogin('');
+  assert.equal(unset.login, null);
+  assert.match(unset.problem ?? '', /GITHUB_BOT_LOGIN is unset and GET \/user failed/);
 });
 
 test('contributor mode does not retry a 401: the token cannot be re-minted', async () => {
@@ -2053,11 +2064,12 @@ test('isLastingFailure: gone or out of reach is lasting; a rate limit, a server 
   assert.equal(isLastingFailure(new Error('socket hang up')), false);
 });
 
-test('tokenLoginProblem refuses a start whose token GitHub refuses', async () => {
+test('checkTokenLogin refuses a start whose token GitHub refuses, the login set or not', async () => {
   const r = await tokenRig((fake) => {
     fake.on('GET /user', { status: 401, body: { message: 'Bad credentials' } });
   });
-  assert.match((await r.adapter.tokenLoginProblem('a-human')) ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
+  assert.match((await r.adapter.checkTokenLogin('a-human')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
+  assert.match((await r.adapter.checkTokenLogin('')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE, so its login is unknown/);
 });
 
 test('listNotifications reads a page past its cap only to learn whether there was more', async () => {
@@ -2086,17 +2098,46 @@ test('listNotifications reads a page past its cap only to learn whether there wa
   assert.equal(more.fake.for('GET /notifications').length, 21);
 });
 
-test('tokenLoginProblem: a 403 that isn\'t a rate limit refuses the start; a rate-limited one lets it go on, unchecked', async () => {
+test('checkTokenLogin: a 403 that isn\'t a rate limit refuses the start; a rate-limited one lets it go on, unchecked', async () => {
   const refused = await tokenRig((fake) => {
     fake.on('GET /user', { status: 403, body: { message: 'Resource not accessible by personal access token' } });
   });
-  assert.match((await refused.adapter.tokenLoginProblem('a-human')) ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
+  assert.match((await refused.adapter.checkTokenLogin('a-human')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
 
   const limited = await tokenRig((fake) => {
     fake.on('GET /user', { status: 403, body: { message: 'API rate limit exceeded for user ID 1.' } });
   });
-  assert.equal(await limited.adapter.tokenLoginProblem('a-human'), null);
+  assert.deepEqual(await limited.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
   assert.ok(limited.logs.some((line) => line.includes('GITHUB_BOT_LOGIN is unchecked')));
+});
+
+test('listOwnOpenPulls asks one search for the user\'s open pull requests in GITHUB_REPOS, and keeps only those', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /search/issues', {
+      body: {
+        items: [
+          { number: 12, updated_at: '2026-10-15T00:09:00Z', html_url: 'https://github.com/anima-research/rayforce/pull/12', repository_url: 'https://api.github.com/repos/Anima-Research/rayforce', pull_request: {} },
+          { number: 13, updated_at: '2026-10-15T00:08:00Z', html_url: 'https://github.com/someone/else/pull/13', repository_url: 'https://api.github.com/repos/someone/else', pull_request: {} },
+          { number: 14, updated_at: '2026-10-15T00:07:00Z', html_url: 'https://github.com/anima-research/rayforce/issues/14', repository_url: 'https://api.github.com/repos/anima-research/rayforce' },
+        ],
+      },
+    });
+  });
+  const repos = [{ owner: 'anima-research', name: 'rayforce' }];
+  assert.deepEqual(await r.adapter.listOwnOpenPulls('a-human', repos), [
+    { repo: repos[0], number: 12, updatedAt: '2026-10-15T00:09:00Z', html_url: 'https://github.com/anima-research/rayforce/pull/12' },
+  ]);
+  const call = r.fake.for('GET /search/issues')[0];
+  assert.equal(call.query.q, 'is:pr is:open author:a-human repo:anima-research/rayforce');
+  assert.equal(call.query.sort, 'updated');
+});
+
+test('getPullHeadSha reads the pull request alone, with no check runs', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12', { body: { number: 12, head: { sha: 'abc123', ref: 'fix' } } });
+  });
+  assert.equal(await r.adapter.getPullHeadSha({ repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' }), 'abc123');
+  assert.equal(r.fake.calls.some((c) => c.path.includes('check-runs')), false);
 });
 
 test('isRateLimit: a 429, or a 403 that says rate limit; nothing else', () => {

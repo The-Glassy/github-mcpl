@@ -89,6 +89,19 @@ function buildAdapter(config: Config, log: Logger): GitHubAdapter {
  */
 async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplServer; running: Running }> {
   const api = buildAdapter(config, log);
+  // Contributor mode checks the token and the repositories before anything
+  // else, and takes GITHUB_BOT_LOGIN from the token when it is unset.
+  if (config.authMode === 'token') {
+    const login = await api.checkTokenLogin(config.botLogin);
+    const problems = [login.problem, ...(await api.repoSpellingProblems(config.repos))];
+    const found = problems.filter((p): p is string => p !== null);
+    if (found.length > 0) {
+      for (const problem of found) log.error(problem);
+      process.exit(1);
+    }
+    if (!config.botLogin) log.info('GITHUB_BOT_LOGIN is unset, so it is the token\'s login', { login: login.login });
+    config.botLogin = login.login as string;
+  }
   const state = GithubState.load(config.stateFile, log);
   const server = new GitHubMcplServer(api, {
     botLogin: config.botLogin,
@@ -103,17 +116,12 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
   // Contributor mode has one ingress, the notifications poller, and no
   // webhook (readConfig already refused GITHUB_WEBHOOK_PORT in this mode).
   if (config.authMode === 'token') {
-    const problems = [await api.tokenLoginProblem(config.botLogin), ...(await api.repoSpellingProblems(config.repos))];
-    const found = problems.filter((p): p is string => p !== null);
-    if (found.length > 0) {
-      for (const problem of found) log.error(problem);
-      process.exit(1);
-    }
     const notifications = new NotificationsPoller({
       api,
       state,
       intervalMs: config.pollIntervalMs,
       repos: config.repos,
+      login: config.botLogin,
       onEvent: server.onEvent,
       logger: log,
     });

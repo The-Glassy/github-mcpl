@@ -16,12 +16,14 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { NotificationsPoller, type NotificationsPollerApi } from '../src/notifications-poller.js';
 import { GithubState } from '../src/state.js';
-import { GitHubApiError, ReadCapError, type NotificationRow, type NotificationsPage } from '../src/github-adapter.js';
+import { GitHubApiError, ReadCapError, type NotificationRow, type NotificationsPage, type OwnPull } from '../src/github-adapter.js';
+import { checksPollKey } from '../src/normalize.js';
 import { tagsFor } from '../src/tags.js';
 import {
   channelId,
   MIN_POLL_INTERVAL_MS,
   POLL_DEDUP_RING,
+  type ChecksSummary,
   type EventActor,
   type NormalizedEvent,
   type PolledComment,
@@ -83,11 +85,17 @@ class FakeGitHub implements NotificationsPollerApi {
   readonly reviews = new Map<string, PolledReview[]>();
   /** A failure each thread's next reads throw, by channel. */
   readonly failing = new Map<string, Error>();
+  /** The token user's open pull requests, as the search finds them. */
+  ownPulls: OwnPull[] = [];
+  /** Each pull request's head sha, by channel. */
+  readonly heads = new Map<string, string>();
+  /** The check runs on a sha, or what looking them up throws. */
+  readonly checks = new Map<string, ChecksSummary | Error>();
   readonly calls: string[] = [];
 
-  notify(thread: ThreadRef, updatedAt: string, repo: RepoRef = thread.repo): void {
+  notify(thread: ThreadRef, updatedAt: string, repo: RepoRef = thread.repo, reason = 'mention'): void {
     this.inbox = this.inbox.filter((n) => !(n.repo.owner === repo.owner && n.repo.name === repo.name && n.number === thread.number));
-    this.inbox.push({ id: `n-${repo.name}-${thread.number}`, updatedAt, reason: 'mention', unread: true, repo, kind: thread.kind, number: thread.number, title: 't' });
+    this.inbox.push({ id: `n-${repo.name}-${thread.number}`, updatedAt, reason, unread: true, repo, kind: thread.kind, number: thread.number, title: 't' });
   }
 
   async listNotifications(opts: { since: string; ifModifiedSince: string | null }): Promise<NotificationsPage> {
@@ -126,6 +134,25 @@ class FakeGitHub implements NotificationsPollerApi {
     this.calls.push(`reviews ${channelId(pull)} since=${since}`);
     return (this.reviews.get(channelId(pull)) ?? []).filter((r) => Date.parse(r.submittedAt) >= Date.parse(since));
   }
+
+  async listOwnOpenPulls(login: string, repos: readonly RepoRef[]): Promise<OwnPull[]> {
+    this.calls.push(`list own pulls ${login}`);
+    return this.ownPulls.filter((p) => repos.some((r) => r.owner === p.repo.owner && r.name === p.repo.name));
+  }
+
+  async getPullHeadSha(pull: ThreadRef): Promise<string> {
+    this.calls.push(`head ${channelId(pull)}`);
+    const sha = this.heads.get(channelId(pull));
+    if (!sha) throw new Error(`no head seeded for ${channelId(pull)}`);
+    return sha;
+  }
+
+  async getCheckRuns(_repo: RepoRef, sha: string): Promise<ChecksSummary> {
+    this.calls.push(`checks ${sha}`);
+    const answer = this.checks.get(sha);
+    if (answer instanceof Error) throw answer;
+    return answer ?? { sha, conclusion: null, total: 0, failed: [] };
+  }
 }
 
 interface Rig {
@@ -140,7 +167,7 @@ interface Rig {
   setNow(at: string): void;
 }
 
-function rig(options: { stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[] } = {}): Rig {
+function rig(options: { stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[]; login?: string } = {}): Rig {
   const github = options.github ?? new FakeGitHub();
   const state = options.state ?? GithubState.load(options.stateFile ?? null);
   const events: NormalizedEvent[] = [];
@@ -155,6 +182,7 @@ function rig(options: { stateFile?: string | null; state?: GithubState; github?:
     state,
     intervalMs: MIN_POLL_INTERVAL_MS,
     repos: options.repos ?? [REPO],
+    ...(options.login === undefined ? {} : { login: options.login }),
     onEvent: (event) => {
       if (refuse.has(event.id)) throw new Error('listener refused it');
       events.push(event);
@@ -935,4 +963,269 @@ test('each thread\'s state is on disk before the next thread is read', async () 
   };
   await r.poller.pollOnce();
   assert.ok(onDisk, 'the first thread\'s cursor was in the state file when the second thread was read');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review requests and the checks on the token user's own pull requests
+
+test('a review_requested notification on a pull request arrives as pull.review_requested, once per notification update', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:40Z', REPO, 'review_requested');
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:09:40Z']);
+  const request = r.events[0];
+  assert.equal(request.kind, 'pull.review_requested');
+  assert.deepEqual(request.thread, PULL);
+  assert.deepEqual(request.actor, HUMAN, 'the pull request\'s author, who usually asks');
+  const tagged = tagsFor(request, { botLogin: 'a-human', maintainers: [] });
+  assert.ok(tagged.tags.includes('github:pr=review_requested'));
+  assert.equal(tagged.metadata.isReviewRequested, true);
+  assert.ok(r.state.snapshot().pollKeys.includes('review_requested:n-rayforce-12:2026-10-15T00:09:40Z'));
+
+  // Listed again with the same update, in the second W takes again: nothing new.
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:09:41 GMT';
+  const again = await r.poller.pollOnce();
+  assert.equal(again.duplicates, 1);
+  assert.equal(r.events.length, 1);
+
+  // A later update with the same reason is delivered again, keyed by the new update.
+  r.github.notify(PULL, '2026-10-15T00:12:00Z', REPO, 'review_requested');
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:12:00 GMT';
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.id).slice(1), ['poll:review_requested:n-rayforce-12:2026-10-15T00:12:00Z']);
+
+  // Another reason, or an issue, is no review request.
+  r.github.notify(PULL, '2026-10-15T00:13:00Z', REPO, 'comment');
+  r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+  r.github.notify(ISSUE, '2026-10-15T00:13:00Z', REPO, 'review_requested');
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:13:00 GMT';
+  await r.poller.pollOnce();
+  assert.equal(r.events.filter((e) => e.kind === 'pull.review_requested').length, 2);
+});
+
+test('a refused review request waits on the retry entry, across a restart, and arrives though no listing shows it again', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-')), 'state.json');
+  const r = rig({ stateFile: file });
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.comments.set(channelId(PULL), [comment(1, 12, '2026-10-15T00:09:20Z')]);
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.refuse.add('poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z');
+  const first = await r.poller.pollOnce();
+  assert.equal(first.failed, 1);
+  assert.deepEqual(r.events.map((e) => e.kind), ['comment.created']);
+  assert.deepEqual(r.state.notificationRetries().map((x) => x.reviewRequest), [{ id: 'n-rayforce-12', updatedAt: '2026-10-15T00:09:30Z' }]);
+
+  const restarted = rig({ stateFile: file, github: r.github });
+  r.github.inbox = [];
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:11:00 GMT';
+  await restarted.poller.pollOnce();
+  assert.deepEqual(restarted.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z'], 'and the comment doesn\'t come twice');
+  assert.deepEqual(restarted.state.notificationRetries(), []);
+});
+
+test('a review request on a thread whose read fails waits with it, and arrives when the read gets through', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.github.failing.set(channelId(PULL), new GitHubApiError(502, 'Bad gateway', 'getPolledThread'));
+  await r.poller.pollOnce();
+  assert.equal(r.events.length, 0);
+  assert.deepEqual(r.state.notificationRetries().map((x) => x.reviewRequest?.id), ['n-rayforce-12']);
+
+  r.github.failing.clear();
+  r.github.inbox = [];
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:11:00 GMT';
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.kind), ['pull.review_requested']);
+});
+
+test('a review request on a thread whose backlog is skipped still arrives, before the notice', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.github.listReviewsSince = async () => {
+    throw new ReadCapError('listReviewsSince');
+  };
+  const result = await r.poller.pollOnce();
+  assert.equal(result.dropped, 1);
+  assert.deepEqual(r.events.map((e) => e.kind), ['pull.review_requested', 'thread.read_failed']);
+});
+
+test('a review request refused beside a skipped backlog waits on a retry entry, and arrives after a 304 and a restart', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-')), 'state.json');
+  const r = rig({ stateFile: file });
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  const readReviews = r.github.listReviewsSince.bind(r.github);
+  r.github.listReviewsSince = async () => {
+    throw new ReadCapError('listReviewsSince');
+  };
+  r.refuse.add('poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z');
+  const first = await r.poller.pollOnce();
+  assert.equal(first.dropped, 1);
+  assert.deepEqual(r.events.map((e) => e.kind), ['thread.read_failed']);
+  assert.deepEqual(r.state.notificationRetries().map((x) => x.reviewRequest?.updatedAt), ['2026-10-15T00:09:30Z']);
+
+  r.github.listReviewsSince = readReviews;
+  const restarted = rig({ stateFile: file, github: r.github });
+  const second = await restarted.poller.pollOnce();
+  assert.equal(second.notModified, true);
+  assert.deepEqual(restarted.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z']);
+  assert.ok(r.github.calls.includes(`reviews ${channelId(PULL)} since=2026-10-15T00:09:29Z`), 'read from its current update on, as the skip left it');
+  assert.deepEqual(restarted.state.notificationRetries(), []);
+});
+
+test('a newer update of a thread\'s review_requested notification supersedes a request still waiting: one request arrives, the newest', async () => {
+  const r = rig();
+  r.github.threads.set(channelId(PULL), threadRow(PULL));
+  r.github.notify(PULL, '2026-10-15T00:09:30Z', REPO, 'review_requested');
+  r.refuse.add('poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z');
+  await r.poller.pollOnce();
+  assert.equal(r.events.length, 0);
+
+  r.github.notify(PULL, '2026-10-15T00:11:00Z', REPO, 'review_requested');
+  r.github.lastModified = 'Wed, 15 Oct 2026 00:11:00 GMT';
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:11:00Z']);
+  assert.deepEqual(r.state.notificationRetries(), []);
+});
+
+/** One of the token user's open pull requests, as the search answers it. */
+const own = (updatedAt: string, pull: ThreadRef = PULL): OwnPull => ({
+  repo: pull.repo,
+  number: pull.number,
+  updatedAt,
+  html_url: `https://github.com/anima-research/rayforce/pull/${pull.number}`,
+});
+
+test('without the token\'s login, a pass looks up no checks', async () => {
+  const r = rig();
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  const result = await r.poller.pollOnce();
+  assert.equal(result.checkLookups, 0);
+  assert.ok(!r.github.calls.some((c) => c.startsWith('list own pulls')));
+});
+
+test('a settled failure on the head of the token user\'s own open pull request arrives as App mode\'s checks.completed, once per result, on 304 passes too', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  r.github.checks.set('sha-one', { sha: 'sha-one', conclusion: 'failure', total: 2, failed: [{ name: 'test', url: 'https://ci/1' }] });
+  const first = await r.poller.pollOnce();
+  assert.equal(first.checkLookups, 1);
+  assert.ok(r.github.calls.includes('list own pulls a-human'));
+  assert.equal(r.events.length, 1);
+  const ci = r.events[0];
+  assert.equal(ci.kind, 'checks.completed');
+  assert.match(ci.id, /^poll:checks:sha-one:failure:1:[0-9a-f]{12}$/);
+  assert.deepEqual(ci.thread, PULL);
+  assert.equal(ci.sha, 'sha-one');
+  assert.deepEqual(ci.checks, { conclusion: 'failure', failed: [{ name: 'test', url: 'https://ci/1' }] });
+  assert.ok(tagsFor(ci, { botLogin: 'a-human', maintainers: [] }).tags.includes('github:ci=failure'));
+
+  // The next pass, a 304, looks again, reads no head while the pull request's update stands, and delivers nothing twice.
+  const second = await r.poller.pollOnce();
+  assert.equal(second.notModified, true);
+  assert.equal(second.checkLookups, 1);
+  assert.equal(second.duplicates, 1);
+  assert.equal(r.github.calls.filter((c) => c.startsWith('head ')).length, 1);
+  assert.equal(r.events.length, 1);
+
+  // A push moves its update: the new head is read, waits while its runs go, and arrives once they settle.
+  r.github.ownPulls = [own('2026-10-15T00:12:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-two');
+  r.github.checks.set('sha-two', { sha: 'sha-two', conclusion: null, total: 2, failed: [] });
+  await r.poller.pollOnce();
+  assert.equal(r.github.calls.filter((c) => c.startsWith('head ')).length, 2);
+  assert.equal(r.events.length, 1, 'nothing while its runs go');
+  r.github.checks.set('sha-two', { sha: 'sha-two', conclusion: 'success', total: 2, failed: [] });
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.slice(1).map((e) => [e.kind, e.sha, e.checks?.conclusion]), [['checks.completed', 'sha-two', 'success']]);
+});
+
+test('more own open pull requests than one pass looks up are taken in turns', async () => {
+  const r = rig({ login: 'a-human' });
+  const pulls: ThreadRef[] = Array.from({ length: 25 }, (_, i) => ({ repo: REPO, number: 100 + i, kind: 'pull' }));
+  r.github.ownPulls = pulls.map((p) => own('2026-10-15T00:09:00Z', p));
+  for (const p of pulls) r.github.heads.set(channelId(p), `sha-${p.number}`);
+  const looked = () => r.github.calls.filter((c) => c.startsWith('checks ')).map((c) => Number(c.slice('checks sha-'.length)));
+  assert.equal((await r.poller.pollOnce()).checkLookups, 20);
+  assert.equal((await r.poller.pollOnce()).checkLookups, 20);
+  assert.deepEqual(new Set(looked()), new Set(pulls.map((p) => p.number)), 'every pull request was looked up within two passes');
+  assert.deepEqual(looked().slice(20, 25), [120, 121, 122, 123, 124], 'the second pass starts where the first stopped');
+});
+
+test('a rate limit that stops a pass\'s lookups leaves the next pass to start where it stopped', async () => {
+  const r = rig({ login: 'a-human' });
+  const pulls: ThreadRef[] = Array.from({ length: 4 }, (_, i) => ({ repo: REPO, number: 100 + i, kind: 'pull' }));
+  r.github.ownPulls = pulls.map((p) => own('2026-10-15T00:09:00Z', p));
+  for (const p of pulls) r.github.heads.set(channelId(p), `sha-${p.number}`);
+  r.github.checks.set('sha-102', new GitHubApiError(403, 'API rate limit exceeded for user ID 1.', 'getCheckRuns'));
+  await r.poller.pollOnce();
+  r.github.checks.delete('sha-102');
+  await r.poller.pollOnce();
+  assert.deepEqual(
+    r.github.calls.filter((c) => c.startsWith('checks ')),
+    ['checks sha-100', 'checks sha-101', 'checks sha-102', 'checks sha-102', 'checks sha-103', 'checks sha-100', 'checks sha-101'],
+  );
+});
+
+test('a head read stands while its pull request\'s update does, for ten minutes at most', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  await r.poller.pollOnce();
+  r.github.heads.set(channelId(PULL), 'sha-two');
+  r.setNow('2026-10-15T00:19:59.000Z');
+  await r.poller.pollOnce();
+  assert.deepEqual(r.github.calls.filter((c) => c.startsWith('checks ')), ['checks sha-one', 'checks sha-one']);
+  r.setNow('2026-10-15T00:20:00.000Z');
+  await r.poller.pollOnce();
+  assert.deepEqual(r.github.calls.filter((c) => c.startsWith('checks ')).slice(2), ['checks sha-two'], 'the head is read again, though its update stood');
+});
+
+test('a refused checks event arrives on the next pass; GitHub\'s rate limit ends a pass\'s lookups, and other failures skip one pull request', async () => {
+  const r = rig({ login: 'a-human' });
+  const second: ThreadRef = { repo: REPO, number: 13, kind: 'pull' };
+  const third: ThreadRef = { repo: REPO, number: 14, kind: 'pull' };
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z'), own('2026-10-15T00:08:00Z', second), own('2026-10-15T00:07:00Z', third)];
+  r.github.heads.set(channelId(PULL), 'sha-a');
+  r.github.heads.set(channelId(second), 'sha-b');
+  r.github.heads.set(channelId(third), 'sha-c');
+  r.github.checks.set('sha-a', new GitHubApiError(502, 'Bad gateway', 'getCheckRuns'));
+  r.github.checks.set('sha-b', { sha: 'sha-b', conclusion: 'failure', total: 1, failed: [{ name: 'lint', url: 'https://ci/b' }] });
+  r.github.checks.set('sha-c', { sha: 'sha-c', conclusion: 'timed_out', total: 1, failed: [] });
+  const once = await r.poller.pollOnce();
+  assert.equal(once.checkLookups, 3, 'a failed lookup skips its pull request alone');
+  assert.deepEqual(r.events.map((e) => e.sha), ['sha-b', 'sha-c']);
+
+  // A refusal isn't recorded, so the next look delivers it.
+  const settled = { sha: 'sha-a', conclusion: 'failure' as const, total: 1, failed: [] };
+  r.github.checks.set('sha-a', settled);
+  r.refuse.add(`poll:${checksPollKey(settled)}`);
+  await r.poller.pollOnce();
+  assert.equal(r.events.length, 2);
+  r.refuse.clear();
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.slice(2).map((e) => e.sha), ['sha-a']);
+
+  // A rate limit stops the lookups at once.
+  r.github.checks.set('sha-a', new GitHubApiError(403, 'API rate limit exceeded for user ID 1.', 'getCheckRuns'));
+  const before = r.github.calls.length;
+  const limited = await r.poller.pollOnce();
+  assert.equal(limited.checkLookups, 1);
+  assert.deepEqual(r.github.calls.slice(before).filter((c) => c.startsWith('checks ')), ['checks sha-a']);
+  assert.ok(r.logs.some((line) => line.includes('rate-limited a check lookup')));
+});
+
+test('a pass whose thread reads met GitHub\'s rate limit looks up no checks', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  r.github.failing.set(channelId(ISSUE), new GitHubApiError(403, 'API rate limit exceeded for user ID 1.', 'getPolledThread'));
+  const result = await r.poller.pollOnce();
+  assert.equal(result.checkLookups, 0);
+  assert.ok(!r.github.calls.some((c) => c.startsWith('list own pulls')));
 });

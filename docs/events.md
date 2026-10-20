@@ -23,12 +23,12 @@ capability grant's decision; a tag only influences treatment afterwards.
 | `pull_request` (`opened`) | `listIssuesSince` | `pull.opened` | pull |
 | `pull_request` (`synchronize`) | — | `pull.synchronize` | pull |
 | `pull_request` (`ready_for_review`) | — | `pull.ready_for_review` | pull |
-| `pull_request` (`review_requested`) | — | `pull.review_requested` | pull |
+| `pull_request` (`review_requested`) | — (contributor mode: a notification whose reason is `review_requested`) | `pull.review_requested` | pull |
 | `pull_request` (`closed`) | `listIssuesSince` | `pull.closed` | pull |
 | `pull_request_review` (`submitted`) | — | `review.submitted` | pull |
 | `pull_request_review_comment` (`created`) | `listReviewCommentsSince` | `review_comment.created` | pull |
 | `pull_request_review_comment` (`edited`) | `listReviewCommentsSince` | `review_comment.edited` | pull |
-| `check_suite` (`completed`) | `getCheckRuns` on an open PR head | `checks.completed` | pull |
+| `check_suite` (`completed`) | `getCheckRuns` on an open PR head (contributor mode: on the head of each open PR the token's user authored) | `checks.completed` | pull |
 | `push` | — | `push` | *none* |
 | — (contributor mode only: the notifications poller stopped reading a thread) | — | `thread.read_failed` | issue or pull |
 
@@ -54,7 +54,7 @@ pair**, and then the rows below.
 | `pull.opened` | `github:pr=opened` | |
 | `pull.synchronize` | `github:pr=synchronize` | |
 | `pull.ready_for_review` | `github:pr=ready_for_review` | |
-| `pull.review_requested` | `github:pr=review_requested` | Not producible for an App identity (e2e round 3): GitHub does not list an App's bot in the Reviewers picker and drops it from `requested_reviewers` through the API (201, empty list). A human asks this connector for a review with a mention, which wakes `chat:mention`. The kind and tag stay for a reviewer that is a user. |
+| `pull.review_requested` | `github:pr=review_requested` | Not producible for an App identity (e2e round 3): GitHub does not list an App's bot in the Reviewers picker and drops it from `requested_reviewers` through the API (201, empty list). A human asks this connector for a review with a mention, which wakes `chat:mention`. The kind and tag stay for a reviewer that is a user, as in contributor mode, where a notification whose reason is `review_requested` arrives as this kind, with the pull request's author as its actor, once per notification update. |
 | `pull.closed` | `github:pr=closed`, plus `github:pr=merged` when the caller passes `merged: true` | |
 | `review.submitted` | `github:review=approved` \| `=changes_requested` \| `=commented`, from `event.review.state` | |
 | `review_comment.created` | `github:review-comment` | `chat:thread` |

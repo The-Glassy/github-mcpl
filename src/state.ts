@@ -459,7 +459,12 @@ function isNotificationRetry(raw: unknown): raw is NotificationRetry {
     (r.kind === 'issue' || r.kind === 'pull') &&
     Number.isInteger(r.attempts) &&
     (r.attempts as number) >= 0 &&
-    (r.cursor === undefined || typeof r.cursor === 'string')
+    (r.cursor === undefined || typeof r.cursor === 'string') &&
+    (r.reviewRequest === undefined ||
+      (!!r.reviewRequest &&
+        typeof r.reviewRequest.id === 'string' &&
+        r.reviewRequest.id !== '' &&
+        isIsoInstant(r.reviewRequest.updatedAt)))
   );
 }
 

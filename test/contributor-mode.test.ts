@@ -69,6 +69,19 @@ test('GITHUB_TOKEN_FILE alone selects contributor mode', () => {
   assert.equal(config.pollIntervalMs, MIN_POLL_INTERVAL_MS);
 });
 
+test('contributor mode may leave GITHUB_BOT_LOGIN unset, for startup to take from the token; App mode may not', () => {
+  const tokenFile = tmpFile('token', 'ghp_fake_token_for_tests\n');
+  const config = readConfig({ GITHUB_TOKEN_FILE: tokenFile, GITHUB_REPOS: 'anima-research/rayforce' });
+  assert.equal(config.authMode, 'token');
+  assert.equal(config.botLogin, '');
+  const keyFile = tmpFile('key.pem', 'not a key');
+  assert.ok(
+    problemsOf({ GITHUB_APP_ID: '1', GITHUB_APP_PRIVATE_KEY_FILE: keyFile, GITHUB_REPOS: 'anima-research/rayforce' }).some((p) =>
+      p.startsWith('GITHUB_BOT_LOGIN: required'),
+    ),
+  );
+});
+
 test('a token file that an editor began with a byte-order mark or a blank line still gives the bare token', () => {
   const tokenFile = tmpFile('token', '\uFEFF\n  ghp_fake_token_for_tests\n');
   const config = readConfig({ GITHUB_TOKEN_FILE: tokenFile, GITHUB_REPOS: 'anima-research/rayforce', GITHUB_BOT_LOGIN: 'a-human' });

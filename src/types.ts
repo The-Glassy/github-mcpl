@@ -939,6 +939,8 @@ export interface NotificationRetry {
   attempts: number;
   /** Its cursor as the head memory holds it, kept here too so eviction there can't lose its place while it waits. */
   cursor?: string;
+  /** A review request listed for it and not yet delivered: the notification's id and `updated_at`, which a later listing won't show again. */
+  reviewRequest?: { id: string; updatedAt: string };
 }
 
 /** How many passes in a row a notified thread may fail before the poller drops it, naming it and the cause. */
@@ -1066,6 +1068,7 @@ export interface Config {
    */
   prBaseAllow: string[];
   stateFile: string | null;
+  /** GITHUB_BOT_LOGIN. `''` only in contributor mode when unset: startup sets it to the token's own login. */
   botLogin: string;
   maintainers: string[];
 }
@@ -1340,8 +1343,10 @@ export function readConfig(env: Env = process.env): Config {
     }
   }
 
+  // Contributor mode may leave it unset: startup takes the token's own login
+  // from `GET /user`, which it checks a set value against anyway.
   const botLogin = env.GITHUB_BOT_LOGIN?.trim() ?? '';
-  if (!botLogin) {
+  if (!botLogin && authMode === 'app') {
     problems.push('GITHUB_BOT_LOGIN: required (from-self and mention detection depend on it)');
   }
 

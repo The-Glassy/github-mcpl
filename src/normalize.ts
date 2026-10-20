@@ -53,11 +53,13 @@ export interface WebhookDelivery {
 /**
  * Which read a poll row came from. Part of the dedup key and of the poll
  * event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1). Each is a
- * `since` query but `review`, contributor mode's notifications poller only: a
- * submitted review, from a list that takes no `since`, which the adapter
- * filters by `submitted_at` itself. The repository poll never fetches one.
+ * `since` query but two, contributor mode's notifications poller only:
+ * `review`, a submitted review, from a list that takes no `since`, which the
+ * adapter filters by `submitted_at` itself; and `review_requested`, a
+ * notification whose reason is a review request, keyed by the notification's
+ * id and `updated_at`. The repository poll never fetches either.
  */
-export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks' | 'review';
+export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks' | 'review' | 'review_requested';
 
 /** `<kind>:<id>:<updated_at>` — what `StateStore.seenPollKey` remembers. */
 export function pollKey(kind: PollRowKind, id: number | string, updatedAt: string): string {
@@ -640,6 +642,36 @@ export function normalizePolledReview(
     ...(sha === undefined ? {} : { sha }),
     review: { id: row.id, state: row.state },
     raw: row,
+  };
+}
+
+/**
+ * A review request, from a `GET /notifications` row whose reason is
+ * `review_requested` (contributor mode's notifications poller only), with the
+ * pull request's row the poller read. The notification names neither who
+ * asked nor whom, so the actor is the pull request's author, who is usually
+ * the one asking, and `raw`, naming no reviewer, makes the server take the
+ * request as the token user's own, which the reason says it is. Keyed by the
+ * notification's id and `updated_at`.
+ */
+export function normalizeNotifiedReviewRequest(
+  repo: RepoRef,
+  row: PolledIssue,
+  notification: { id: string; updatedAt: string },
+  receivedAt: string,
+): NormalizedEvent {
+  const key = pollKey('review_requested', notification.id, notification.updatedAt);
+  return {
+    id: pollEventId(key),
+    receivedAt,
+    repo,
+    kind: 'pull.review_requested',
+    thread: { repo, number: row.number, kind: 'pull' },
+    actor: row.author,
+    title: row.title,
+    body: row.body,
+    html_url: row.html_url,
+    raw: { reason: 'review_requested', notification: notification.id, updatedAt: notification.updatedAt },
   };
 }
 

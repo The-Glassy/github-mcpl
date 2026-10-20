@@ -203,9 +203,11 @@ The contract names the variables but not every default or requiredness.
   they just do not survive a restart.
 - `GITHUB_REPOS` set but empty is a startup error, as is more than one entry
   (v1). Both are reported as `GITHUB_REPOS: …`.
-- `GITHUB_BOT_LOGIN` is required: from-self detection is a correctness
-  property (without it the server can answer itself), so it is not something
-  to default.
+- `GITHUB_BOT_LOGIN` is required with the App: from-self detection is a
+  correctness property (without it the server can answer itself), so it is
+  not something to guess. Contributor mode can leave it unset, since there
+  `GET /user` says whose the token is: startup takes that login, and stops
+  when GitHub doesn't answer.
 
 ## Not materialized by .1
 

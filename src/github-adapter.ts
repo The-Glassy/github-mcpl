@@ -356,6 +356,16 @@ export interface NotificationRow {
   title: string;
 }
 
+/** An open pull request the token's user authored, as `GitHubAdapter.listOwnOpenPulls` found it. */
+export interface OwnPull {
+  /** The GITHUB_REPOS entry it is in, as configured. */
+  repo: RepoRef;
+  number: number;
+  /** Its `updated_at`, which a push moves, so an unchanged one says its head hasn't moved either. */
+  updatedAt: string;
+  html_url: string;
+}
+
 /** What `GitHubAdapter.listNotifications` read: every page's threads, and the first page's headers. */
 export interface NotificationsPage {
   notifications: NotificationRow[];
@@ -1745,28 +1755,93 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * Contributor mode: what's wrong with GITHUB_BOT_LOGIN, or null. It must be
-   * the token's own login as GitHub spells it, since from-self and the
-   * own-comment checks compare against it exactly, and any other value would
-   * wake the agent on its own posts. A token GitHub refuses (401, or a 403
-   * that isn't a rate limit) is a problem too. Null when GitHub didn't answer
-   * the question (unreachable, a server error, a rate limit): the start goes
-   * on unchecked, with a warning, and the poller logs its own failures.
+   * Contributor mode: the open pull requests `login` authored in `repos`, most
+   * recently updated first, from one search (the search API's own rate limit,
+   * not the 5,000 an hour), one page of 100, past which it logs what it left
+   * out. A result from any other
+   * repository is left out. The search names no head, so
+   * {@link GitHubAdapter.getPullHeadSha} reads it.
    */
-  async tokenLoginProblem(botLogin: string): Promise<string | null> {
+  async listOwnOpenPulls(login: string, repos: readonly RepoRef[]): Promise<OwnPull[]> {
+    if (repos.length === 0) return [];
+    return this.call('listOwnOpenPulls', async () => {
+      const res = await this.octokit.request('GET /search/issues', {
+        q: `is:pr is:open author:${login} ${repos.map((repo) => `repo:${repoSlug(repo)}`).join(' ')}`,
+        sort: 'updated',
+        order: 'desc',
+        per_page: 100,
+      });
+      const data = res.data as { total_count?: number; items?: (ApiIssue & { repository_url?: string })[] };
+      const items = data.items ?? [];
+      if ((data.total_count ?? 0) > items.length) {
+        this.log('warn', 'more open pull requests by the token\'s user than one search page holds; only the most recently updated have their checks looked up', {
+          total: data.total_count,
+          read: items.length,
+        });
+      }
+      const pulls: OwnPull[] = [];
+      for (const item of items) {
+        const repo = repos.find((allowed) => sameRepoAsGitHub(repoOfUrl(item.repository_url), allowed));
+        if (!repo || !item.pull_request || !item.number) continue;
+        pulls.push({ repo, number: item.number, updatedAt: item.updated_at ?? '', html_url: item.html_url ?? '' });
+      }
+      return pulls;
+    });
+  }
+
+  /** A pull request's head sha, and nothing else: one read, with none of {@link GitHubAdapter.getPullRequest}'s check runs. */
+  async getPullHeadSha(pull: ThreadRef): Promise<string> {
+    return this.call('getPullHeadSha', async () => {
+      const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+        owner: pull.repo.owner,
+        repo: pull.repo.name,
+        pull_number: pull.number,
+      });
+      const sha = (res.data as ApiPull).head?.sha ?? '';
+      if (!sha) throw new GitHubApiError(0, 'GitHub answered with no head sha', 'getPullHeadSha');
+      return sha;
+    });
+  }
+
+  /**
+   * Contributor mode: the token's login, which from-self and the own-comment
+   * checks compare against exactly, or why the start can't go on. A set
+   * GITHUB_BOT_LOGIN must be the token's own login as GitHub spells it, since
+   * any other value would wake the agent on its own posts; an unset one is
+   * the login `GET /user` answers. A token GitHub refuses (401, or a 403 that
+   * isn't a rate limit) is a problem either way. When GitHub doesn't answer
+   * (unreachable, a server error, a rate limit), a set value is used
+   * unchecked, with a warning, and an unset one is a problem: there is no
+   * login to use.
+   */
+  async checkTokenLogin(botLogin: string): Promise<{ login: string; problem: null } | { login: null; problem: string }> {
     let login: string;
     try {
       login = (await this.getAuthenticatedBot()).login;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof GitHubApiError && (err.status === 401 || (err.status === 403 && !isRateLimit(err)))) {
-        return `GET /user refused the token in GITHUB_TOKEN_FILE, so GITHUB_BOT_LOGIN can't be checked against it: ${message}`;
+        return {
+          login: null,
+          problem: botLogin
+            ? `GET /user refused the token in GITHUB_TOKEN_FILE, so GITHUB_BOT_LOGIN can't be checked against it: ${message}`
+            : `GET /user refused the token in GITHUB_TOKEN_FILE, so its login is unknown: ${message}`,
+        };
+      }
+      if (!botLogin) {
+        return {
+          login: null,
+          problem: `GITHUB_BOT_LOGIN is unset and GET /user failed, so the token's login is unknown: set GITHUB_BOT_LOGIN, or start again once GitHub answers (${message})`,
+        };
       }
       this.log('warn', 'GET /user failed, so GITHUB_BOT_LOGIN is unchecked against the token', { error: message });
-      return null;
+      return { login: botLogin, problem: null };
     }
-    if (login === botLogin) return null;
-    return `GITHUB_BOT_LOGIN is "${botLogin}", but the token in GITHUB_TOKEN_FILE belongs to "${login}": set GITHUB_BOT_LOGIN to "${login}", spelled exactly so`;
+    if (!botLogin || login === botLogin) return { login, problem: null };
+    return {
+      login: null,
+      problem: `GITHUB_BOT_LOGIN is "${botLogin}", but the token in GITHUB_TOKEN_FILE belongs to "${login}": set GITHUB_BOT_LOGIN to "${login}", spelled exactly so, or leave it unset`,
+    };
   }
 
   /**
