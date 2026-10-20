@@ -714,7 +714,11 @@ export function normalizeNotifiedReviewRequest(
 /** A {@link ChecksSummary} whose runs have all finished. */
 export type CompletedChecksSummary = ChecksSummary & { conclusion: CheckConclusion };
 
-/** Have the runs on this sha finished, so that `checks.completed` is true? */
+/**
+ * Is this sha's result decided, so that `checks.completed` is true? Every run
+ * finished, or a failure, which is a failure whatever still runs; the latter
+ * carries `unfinished`, since more failures may come.
+ */
 export function isCompletedSummary(summary: ChecksSummary): summary is CompletedChecksSummary {
   return summary.total > 0 && summary.conclusion !== null;
 }

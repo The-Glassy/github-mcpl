@@ -847,6 +847,15 @@ test('getCheckRuns rolls a sha’s runs up and lists the failures', async () => 
   assert.equal(pull.checksSummary?.conclusion, 'failure');
 });
 
+test('summarizeChecks marks a failure beside a run still going, or an unread page, as unfinished, and nothing else', () => {
+  const failed = { name: 'a', status: 'completed', conclusion: 'failure' };
+  const going = summarizeChecks('s', [failed, { name: 'b', status: 'in_progress', conclusion: null }]);
+  assert.equal(going.conclusion, 'failure');
+  assert.equal(going.unfinished, true);
+  assert.equal(summarizeChecks('s', [failed], { total: 600, truncated: true }).unfinished, true);
+  assert.equal('unfinished' in summarizeChecks('s', [failed, { name: 'b', status: 'completed', conclusion: 'success' }]), false);
+});
+
 test('summarizeChecks: running is undecided, all-clear is success, empty is null', () => {
   assert.equal(summarizeChecks('s', []).conclusion, null);
   assert.equal(

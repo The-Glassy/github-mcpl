@@ -28,7 +28,7 @@ capability grant's decision; a tag only influences treatment afterwards.
 | `pull_request_review` (`submitted`) | — | `review.submitted` | pull |
 | `pull_request_review_comment` (`created`) | `listReviewCommentsSince` | `review_comment.created` | pull |
 | `pull_request_review_comment` (`edited`) | `listReviewCommentsSince` | `review_comment.edited` | pull |
-| `check_suite` (`completed`) | `getCheckRuns` on an open PR head (contributor mode: on the head of each open PR the token's user authored, the 100 most recently updated, until its result arrives and again when it moves or ten minutes on) | `checks.completed` | pull |
+| `check_suite` (`completed`) | `getCheckRuns` on an open PR head (contributor mode: on the head of each open PR the token's user authored, the 100 most recently updated, until a result with every run finished arrives, or for two minutes with no runs, and again when it moves or ten minutes on) | `checks.completed` | pull |
 | `push` | — | `push` | *none* |
 | — (contributor mode only: the notifications poller stopped reading a thread) | — | `thread.read_failed` | issue or pull |
 

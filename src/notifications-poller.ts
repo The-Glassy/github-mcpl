@@ -34,10 +34,12 @@
  * since a later listing won't show it again. And each pass whose reads met no
  * rate limit, a 304's included, looks up the checks on the head of each open
  * pull request the token's user authored, since no notification says they
- * finished, leaving one whose finished result it delivered until its update
- * moves or its head read is ten minutes old
- * ({@link NotificationsPoller.pollOwnChecks}). App mode's repository poll looks up the heads of the pull
- * requests it saw move, until they settle.
+ * finished. It leaves a head alone, until its update moves or its head read
+ * is ten minutes old, once a result with every run finished was delivered,
+ * or once it has had no runs for two minutes since its head read; a failure
+ * delivered while other runs go is looked up each pass until they finish
+ * ({@link NotificationsPoller.pollOwnChecks}). App mode's repository poll
+ * looks up the heads of the pull requests it saw move, until they settle.
  *
  * **A thread with no cursor** reads its rows from {@link NOTIFICATION_DELAY_MS}
  * before GitHub's previous answer to a listing, 304s included (before W, when
@@ -347,8 +349,9 @@ export const HEAD_READ_TTL_MS = 10 * 60_000;
 
 /**
  * How long after its head was read a pull request with no check runs at all
- * counts as having none to wait for, until its head is read again: long enough
- * for a push's runs to be created.
+ * counts as having none to wait for, until its head is read again. A choice,
+ * not a measured bound: runs a push's CI creates later than this arrive with
+ * the next head read, up to {@link HEAD_READ_TTL_MS} after the last.
  */
 export const NO_CHECKS_SETTLE_MS = 2 * 60_000;
 
