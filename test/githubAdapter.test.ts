@@ -1836,6 +1836,17 @@ test('listReviewsSince costs a long history nothing: it reads page 1 and back fr
     else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 1 is one read');
   }
 
+  // A page past the cap that holds older and newer reviews counts: 22 pages, the cursor inside page 2.
+  const mixed = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+      const page = Number(req.query.page);
+      if (page === 1) return reviewPage(1, 22, reviewRows(1, '2026-09-01T00:00:00Z'));
+      if (page === 2) return reviewPage(2, 22, [...reviewRows(2, '2026-09-01T00:00:00Z', 50), ...reviewRows(3000, '2026-10-01T00:00:00Z', 50)]);
+      return reviewPage(page, 22, reviewRows(page, '2026-10-05T00:00:00Z'));
+    });
+  });
+  await assert.rejects(mixed.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), ReadCapError, 'a review in the cursor\'s own second is new');
+
   // The same edge with the old boundary on page 2 of 22: page 2 is read, and counts only if it holds a new review.
   for (const [page2At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
     const edge = await tokenRig((fake) => {
@@ -2156,6 +2167,14 @@ test('getPullHeadSha reads the pull request alone, with no check runs', async ()
   });
   assert.equal(await r.adapter.getPullHeadSha({ repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' }), 'abc123');
   assert.equal(r.fake.calls.some((c) => c.path.includes('check-runs')), false);
+  const headless = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12', { body: { number: 12, head: {} } });
+  });
+  await assert.rejects(
+    () => headless.adapter.getPullHeadSha({ repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' }),
+    (err: Error) => err.message === 'getPullHeadSha: GitHub answered with no head sha',
+    'the operation named once',
+  );
 });
 
 test('isRateLimit: a 429, or a 403 that says rate limit; nothing else', () => {
@@ -2237,7 +2256,11 @@ test('a per-thread read takes exactly 2,000 rows whole, fails past them, and fai
   const odd = await tokenRig((fake) => {
     fake.on('GET /repos/anima-research/rayforce/issues/7/comments', { body: { message: 'not a list' } });
   });
-  await assert.rejects(() => odd.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z'), /something other than a list/);
+  await assert.rejects(
+    () => odd.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z'),
+    (err: Error) => err.message === 'listCommentsSince: GitHub answered page 1 with something other than a list',
+    'the operation named once',
+  );
 });
 
 test('searchIssues drops every repo:, user:, org: and owner: qualifier, so the search stays in the one repository', async () => {

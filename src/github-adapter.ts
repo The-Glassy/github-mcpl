@@ -361,7 +361,7 @@ export interface OwnPull {
   /** The GITHUB_REPOS entry it is in, as configured. */
   repo: RepoRef;
   number: number;
-  /** Its `updated_at`, which a push moves. The search's can lag a push, so an unchanged one says its head hasn't moved only for a while. */
+  /** Its `updated_at`, which a push moves. The search's may lag a push, so an unchanged one is taken to say its head hasn't moved only for a while. */
   updatedAt: string;
   html_url: string;
 }
@@ -2267,6 +2267,7 @@ export function summarizeChecks(
     conclusion,
     total: options.total ?? runs.length,
     failed: failed.slice(0, LIMITS.listEntries),
+    ...(incomplete ? { unfinished: true } : {}),
   };
 }
 

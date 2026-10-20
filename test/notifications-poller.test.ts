@@ -1186,8 +1186,64 @@ test('a delivered result isn\'t looked up again until ten minutes pass, so a re-
   assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure', 'success'], 'the re-run\'s result, on the same head');
   assert.equal(r.github.calls.filter((c) => c.startsWith('head ')).length, 2, 'its head read again with it');
   // A known result once the head is read again counts as delivered too: not looked up again within ten minutes.
-  r.setNow('2026-10-15T00:25:00.000Z');
-  assert.equal((await r.poller.pollOnce()).checkLookups, 0);
+  r.setNow('2026-10-15T00:30:00.000Z');
+  const known = await r.poller.pollOnce();
+  assert.equal(known.checkLookups, 1);
+  assert.equal(known.duplicates, 1);
+  r.setNow('2026-10-15T00:35:00.000Z');
+  const before = r.github.calls.length;
+  await r.poller.pollOnce();
+  assert.deepEqual(r.github.calls.slice(before).filter((c) => c.startsWith('checks ') || c.startsWith('head ')), [], 'no request for it');
+});
+
+test('a failure while other runs go is delivered, and looked up again each pass until they finish', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  r.github.checks.set('sha-one', { sha: 'sha-one', conclusion: 'failure', total: 3, failed: [{ name: 'lint', url: 'https://ci/1' }], unfinished: true });
+  await r.poller.pollOnce();
+  r.github.checks.set('sha-one', { sha: 'sha-one', conclusion: 'failure', total: 3, failed: [{ name: 'lint', url: 'https://ci/1' }, { name: 'test', url: 'https://ci/2' }] });
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events.map((e) => e.checks?.failed.length), [1, 2], 'the later failure arrives on the next pass');
+  const before = r.github.calls.length;
+  await r.poller.pollOnce();
+  assert.deepEqual(r.github.calls.slice(before).filter((c) => c.startsWith('checks ')), [], 'settled once every run finished');
+});
+
+test('a head with no check runs is looked up each pass for two minutes after its head is read, then left until it moves or ten minutes pass', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-one');
+  const lookups = () => r.github.calls.filter((c) => c.startsWith('checks ')).length;
+  await r.poller.pollOnce();
+  r.setNow('2026-10-15T00:11:59.000Z');
+  await r.poller.pollOnce();
+  assert.equal(lookups(), 2, 'still looked up inside two minutes, when a push\'s runs may not exist yet');
+  r.setNow('2026-10-15T00:12:00.000Z');
+  await r.poller.pollOnce();
+  r.setNow('2026-10-15T00:15:00.000Z');
+  await r.poller.pollOnce();
+  assert.equal(lookups(), 3, 'none once it had no runs two minutes on');
+  r.setNow('2026-10-15T00:20:00.000Z');
+  await r.poller.pollOnce();
+  assert.equal(lookups(), 4, 'looked up with its head ten minutes on');
+});
+
+test('heads whose results stand still move the turn, so the rest of more than one pass\'s worth are reached', async () => {
+  const r = rig({ login: 'a-human' });
+  const pulls: ThreadRef[] = Array.from({ length: 25 }, (_, i) => ({ repo: REPO, number: 100 + i, kind: 'pull' }));
+  r.github.ownPulls = pulls.map((p) => own('2026-10-15T00:09:00Z', p));
+  for (const p of pulls) {
+    r.github.heads.set(channelId(p), `sha-${p.number}`);
+    // The first 20 settle; the last five keep running.
+    if (p.number < 120) r.github.checks.set(`sha-${p.number}`, { sha: `sha-${p.number}`, conclusion: 'success', total: 1, failed: [] });
+  }
+  const looked = () => r.github.calls.filter((c) => c.startsWith('checks ')).map((c) => Number(c.slice('checks sha-'.length)));
+  await r.poller.pollOnce();
+  await r.poller.pollOnce();
+  const before = looked().length;
+  await r.poller.pollOnce();
+  assert.deepEqual(looked().slice(before), [120, 121, 122, 123, 124], 'the running five are reached past the settled ones');
 });
 
 test('a failed search for the token user\'s open pull requests looks up no checks, and the pass still moves the watermark', async () => {
@@ -1200,7 +1256,14 @@ test('a failed search for the token user\'s open pull requests looks up no check
   r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
   const result = await r.poller.pollOnce();
   assert.equal(result.checkLookups, 0);
-  assert.notEqual(r.state.notificationsWatermark().since, null, 'the listing\'s watermark was stored');
+  // The same pass with a search that works stores the same watermark.
+  const control = rig({ login: 'a-human' });
+  control.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  control.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  control.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+  await control.poller.pollOnce();
+  assert.notEqual(control.state.notificationsWatermark().lastModified, null, 'the listing\'s answer was stored');
+  assert.deepEqual(r.state.notificationsWatermark(), control.state.notificationsWatermark());
 });
 
 test('more own open pull requests than one pass looks up are taken in turns', async () => {

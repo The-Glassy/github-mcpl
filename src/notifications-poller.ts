@@ -33,9 +33,10 @@
  * `updated_at`; one not yet delivered waits on its thread's retry entry,
  * since a later listing won't show it again. And each pass whose reads met no
  * rate limit, a 304's included, looks up the checks on the head of each open
- * pull request the token's user authored whose result it hasn't delivered
- * ({@link NotificationsPoller.pollOwnChecks}), since no notification says
- * they finished. App mode's repository poll looks up the heads of the pull
+ * pull request the token's user authored, since no notification says they
+ * finished, leaving one whose finished result it delivered until its update
+ * moves or its head read is ten minutes old
+ * ({@link NotificationsPoller.pollOwnChecks}). App mode's repository poll looks up the heads of the pull
  * requests it saw move, until they settle.
  *
  * **A thread with no cursor** reads its rows from {@link NOTIFICATION_DELAY_MS}
@@ -343,6 +344,13 @@ const SERVER_ACTOR: EventActor = { login: 'github-mcpl[server]', isBot: true };
  * so an unchanged one doesn't prove the head unmoved for long.
  */
 export const HEAD_READ_TTL_MS = 10 * 60_000;
+
+/**
+ * How long after its head was read a pull request with no check runs at all
+ * counts as having none to wait for, until its head is read again: long enough
+ * for a push's runs to be created.
+ */
+export const NO_CHECKS_SETTLE_MS = 2 * 60_000;
 
 /** The longest delay setTimeout keeps; a longer one fires after a millisecond. */
 const MAX_TIMER_MS = 2 ** 31 - 1;
@@ -737,9 +745,11 @@ export class NotificationsPoller {
    * have all finished is a `checks.completed` event as App mode's repository
    * poll makes it, keyed by its sha, conclusion and failed jobs, so each
    * result is delivered once and a re-run that changes it is news. Once its
-   * result is delivered, a head isn't looked up again until its pull
-   * request's `updated_at` moves or its head read is {@link HEAD_READ_TTL_MS}
-   * old, so a re-run on an unmoved head arrives within that time. A refused
+   * result is delivered with every run finished, or it has had no runs for
+   * {@link NO_CHECKS_SETTLE_MS} since its head was read, a head isn't looked
+   * up again until its pull request's `updated_at` moves or its head read is
+   * {@link HEAD_READ_TTL_MS} old, so a re-run on an unmoved head is seen on
+   * the first look after that. A refused
    * one isn't recorded, so the pass that next looks at it delivers it.
    * GitHub's rate limit ends the lookups until the next pass; any other
    * failure skips that pull request this pass.
@@ -802,13 +812,19 @@ export class NotificationsPoller {
         continue;
       }
       tried += 1;
-      if (!isCompletedSummary(summary)) continue;
+      const head = this.heads.get(channel) as { settled: boolean; readAt: number };
+      if (!isCompletedSummary(summary)) {
+        // No runs a while after its head was read: nothing to wait for until it's read again.
+        if (summary.total === 0 && now - head.readAt >= NO_CHECKS_SETTLE_MS) head.settled = true;
+        continue;
+      }
       const event = normalizePolledChecks(pull.repo, thread, summary, pull.html_url, receivedAt);
       const key = ringKey(event);
-      const head = this.heads.get(channel) as { settled: boolean };
+      // A failure while other runs go may yet gain failures of its own: not settled until they finish.
+      const settles = summary.unfinished !== true;
       if (alreadySeen.has(key)) {
         out.duplicates += 1;
-        head.settled = true;
+        head.settled = settles;
         continue;
       }
       try {
@@ -822,7 +838,7 @@ export class NotificationsPoller {
       }
       this.state.seenPollKey(key);
       alreadySeen.add(key);
-      head.settled = true;
+      head.settled = settles;
       out.delivered.push(event);
     }
     this.checkTurn = start + tried;

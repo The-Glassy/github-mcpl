@@ -215,6 +215,8 @@ export interface ChecksSummary {
   conclusion: CheckConclusion | null;
   total: number;
   failed: FailedCheck[];
+  /** Present and true when a run is still going or wasn't read, so a failure isn't yet the sha's last word. */
+  unfinished?: boolean;
 }
 
 export interface PullRequest {
