@@ -48,6 +48,14 @@ import {
   type ThreadRef,
 } from './types.js';
 import type { EventListener } from './webhook.js';
+import { POLL_MAX_ENTRIES } from './github-adapter.js';
+
+/** True when `at` is at or after `since`; an unreadable stamp answers false. */
+const atOrAfterInstant = (at: string, since: string): boolean => {
+  const x = Date.parse(at);
+  const y = Date.parse(since);
+  return Number.isFinite(x) && Number.isFinite(y) && x >= y;
+};
 
 /** Amendment 1: "at most 20 PRs per poll" get their check runs fetched. */
 export const MAX_CHECKED_PULLS_PER_POLL = 20;
@@ -73,6 +81,13 @@ export const MAX_HEAD_BACKLOG = 200;
  * is allowed to take longer than ten minutes.
  */
 export const MAX_HEAD_ATTEMPTS = 10;
+
+/**
+ * How many threads' closes the `arrivals` scope remembers, in memory, to
+ * tell a reopen by. Kept apart from the durable head memory, whose 200
+ * entries hold the notifications poller's thread cursors.
+ */
+export const ARRIVALS_MARKER_MEMORY = 1000;
 
 /** The part of {@link GitHubApi} the poller uses. */
 export type PollerApi = Pick<
@@ -100,10 +115,25 @@ export interface IngressState {
   snapshot(): { pollKeys: string[] };
 }
 
+/**
+ * What a pass delivers. `all` is App mode's repository poll. `arrivals` is
+ * contributor mode's owned-repository poll (owned-repos.ts), which the
+ * notifications poller runs beside its own pass: an issue or pull request
+ * opened or reopened, and a conversation comment posted, by anyone but
+ * {@link PollerOptions.login}. It reads no review comments and looks up no
+ * checks, and drops every other row at collection, keeping only its marker,
+ * so a later reopen can be told from an edit.
+ */
+export type PollScope = 'all' | 'arrivals';
+
 export interface PollerOptions {
   api: PollerApi;
   /** GITHUB_REPOS. The poller only ever asks these repositories. */
   repos: readonly RepoRef[];
+  /** Default `all`. */
+  scope?: PollScope;
+  /** The token's login, whose own openings and comments the `arrivals` scope leaves out. */
+  login?: string;
   state: IngressState;
   /** GITHUB_POLL_INTERVAL_MS. 0 means polling is off and `start()` is a no-op. */
   intervalMs: number;
@@ -192,7 +222,18 @@ interface Candidate {
 
 export class Poller {
   private readonly api: PollerApi;
-  private readonly repos: readonly RepoRef[];
+  private repos: readonly RepoRef[];
+  private readonly scope: PollScope;
+  private readonly login: string;
+  /** The `arrivals` scope's markers, by channel, oldest first. */
+  private readonly arrivalMarkers = new Map<string, string>();
+  /**
+   * While a capped list holds the cursor back, where the backlog began: the
+   * `arrivals` scope judges an opening or a comment new against it, since a
+   * row first read on a later pass may have been created before that pass's
+   * cursor. Cleared by the first pass that reads to its start.
+   */
+  private catchUpSince: string | null = null;
   private readonly state: IngressState;
   private readonly configuredIntervalMs: number;
   private readonly onEvent: EventListener;
@@ -217,6 +258,8 @@ export class Poller {
   constructor(opts: PollerOptions) {
     this.api = opts.api;
     this.repos = opts.repos;
+    this.scope = opts.scope ?? 'all';
+    this.login = (opts.login ?? '').toLowerCase();
     this.state = opts.state;
     this.configuredIntervalMs = opts.intervalMs;
     this.onEvent = opts.onEvent;
@@ -226,6 +269,11 @@ export class Poller {
     this.maxHeadBacklog = opts.maxHeadBacklog ?? MAX_HEAD_BACKLOG;
     this.maxHeadAttempts = opts.maxHeadAttempts ?? MAX_HEAD_ATTEMPTS;
     this.checkGate = opts.checkGate ?? new CheckGate();
+  }
+
+  /** The repositories the next pass asks; the owned-repository poll narrows them as permissions change. */
+  setRepos(repos: readonly RepoRef[]): void {
+    this.repos = repos;
   }
 
   /** Heads still waiting for their check runs to settle. */
@@ -315,14 +363,20 @@ export class Poller {
    * the dedup key, and the pull-request head a `pull.synchronize` announces
    * ({@link Candidate.head}).
    */
-  async pollOnce(): Promise<PollResult> {
+  async pollOnce(seen?: ReadonlySet<string>): Promise<PollResult> {
     const startedAt = this.now();
     const since = this.state.lastPollAt() ?? new Date(startedAt.getTime() - this.effectiveIntervalMs).toISOString();
     const receivedAt = startedAt.toISOString();
 
     const candidates: Candidate[] = [];
+    // Where the cursor may move to: the pass's start, or, when a list stopped
+    // at the adapter's cap, the last row it got, so the rest come next pass.
+    let advanceTo = receivedAt;
+    const judgeSince = this.scope === 'arrivals' ? (this.catchUpSince ?? since) : since;
     for (const repo of this.repos) {
-      candidates.push(...(await this.collectRows(repo, since, receivedAt)));
+      const rows = await this.collectRows(repo, since, judgeSince, receivedAt);
+      candidates.push(...rows.candidates);
+      if (rows.holdAt !== null && rows.holdAt < advanceTo) advanceTo = rows.holdAt;
     }
     // One drain for every repository together, so the cap is a cap on the
     // pass and not on each repository in turn.
@@ -330,8 +384,11 @@ export class Poller {
     candidates.push(...checks.candidates);
     candidates.sort((a, b) => (a.at === b.at ? a.key.localeCompare(b.key) : a.at.localeCompare(b.at)));
 
-    // One read of the ring per pass: the write happens after delivery.
+    // One read of the ring per pass: the write happens after delivery. A
+    // caller running another ingress in the same pass passes what that one
+    // delivered, which the bounded ring may no longer hold.
     const alreadySeen = new Set(this.state.snapshot().pollKeys);
+    for (const key of seen ?? []) alreadySeen.add(key);
     const result: PollResult = {
       since,
       delivered: [],
@@ -354,7 +411,7 @@ export class Poller {
       // Committed on exactly the terms `retire` is: the listener took the
       // event, or the ring says an earlier pass already got it through.
       const commitHead = (): void => {
-        if (candidate.head) this.state.setPolledHead(candidate.head.channel, candidate.head.sha);
+        if (candidate.head) this.setMarker(candidate.head.channel, candidate.head.sha);
       };
 
       if (alreadySeen.has(candidate.key) || deliveredThisPass.has(candidate.key)) {
@@ -402,7 +459,14 @@ export class Poller {
     result.checksBacklog = this.backlog.size;
 
     if (result.failed === 0) {
-      this.state.setLastPollAt(receivedAt);
+      this.state.setLastPollAt(advanceTo);
+      this.catchUpSince = advanceTo === receivedAt ? null : judgeSince;
+      if (advanceTo !== receivedAt) {
+        this.logger.warn('poll cursor moved only to the last row a capped list returned; the rest come next pass', {
+          since,
+          cursor: advanceTo,
+        });
+      }
       result.cursorAdvanced = true;
     } else {
       this.logger.warn('poll cursor held back: a delivery failed in this pass', {
@@ -429,18 +493,48 @@ export class Poller {
    * lookup rather than looked up here, so the cap and the retries belong to
    * the backlog and not to one repository's turn.
    */
-  private async collectRows(repo: RepoRef, since: string, receivedAt: string): Promise<Candidate[]> {
+  private async collectRows(
+    repo: RepoRef,
+    since: string,
+    judgeSince: string,
+    receivedAt: string,
+  ): Promise<{ candidates: Candidate[]; holdAt: string | null }> {
     const out: Candidate[] = [];
+    // A list the adapter cut at its cap holds the cursor a second before its
+    // last row (rows come oldest first, stamped in whole seconds, and `since`
+    // may exclude its own instant), so rows tied with it come again; the ring
+    // drops the rows read twice.
+    let holdAt: string | null = null;
+    const hold = (rows: readonly { updatedAt: string }[]): void => {
+      const last = rows[rows.length - 1]?.updatedAt;
+      if (rows.length < POLL_MAX_ENTRIES || last === undefined) return;
+      const at = Date.parse(last) - 1000;
+      // A cap filled within one second would hold the cursor in place for good: let it move.
+      if (!Number.isFinite(at) || at <= Date.parse(since)) {
+        this.logger.warn('poll list capped within one second of its cursor; the cursor moves on and rows past the cap may be missed', {
+          repo: repoSlug(repo),
+          since,
+        });
+        return;
+      }
+      if (holdAt === null || at < Date.parse(holdAt)) holdAt = new Date(at).toISOString();
+    };
 
     const issues = await this.api.listIssuesSince(repo, since);
+    hold(issues);
     for (const row of issues) {
       // What the last pass recorded for this thread (amendment 2a for a pull
       // request's head, a state-and-text fingerprint for an issue) turns a
       // real change into an event and drops the row a comment only bumped.
       const channel = channelId({ repo, number: row.number, kind: row.isPullRequest ? 'pull' : 'issue' });
-      const event = normalizePolledIssue(repo, row, receivedAt, since, this.state.polledHead(channel) ?? undefined);
-      const marker = polledMarker(row);
-      const openHead = row.isPullRequest && row.state === 'open' && row.headSha ? row.headSha : undefined;
+      const previous = this.marker(channel);
+      const normalized = normalizePolledIssue(repo, row, receivedAt, judgeSince, previous);
+      const event = this.scope === 'arrivals' ? this.arrival(repo, normalized, row, previous, receivedAt) : normalized;
+      // A reopened pull request whose head the adapter didn't read still
+      // needs its close replaced, or each later bump would reopen it again.
+      const marker = polledMarker(row) ?? (event !== null && this.scope === 'arrivals' ? 'open' : undefined);
+      const openHead =
+        this.scope === 'all' && row.isPullRequest && row.state === 'open' && row.headSha ? row.headSha : undefined;
       if (event) {
         // The marker rides with the candidate and is committed on acceptance,
         // so a refusal leaves the poller still believing the old one and the
@@ -459,17 +553,84 @@ export class Poller {
         // and refreshes the entry's place in the eviction order, which is why
         // a long-lived thread is not evicted ahead of ones nobody has looked
         // at since.
-        this.state.setPolledHead(channel, marker);
+        //
+        // The `arrivals` scope also lands here for every row it leaves out,
+        // and needs a marker only to tell a reopen by: it keeps a close's,
+        // and writes no other, so the head memory it shares with the
+        // notifications poller's thread cursors turns over only as fast as
+        // threads close.
+        if (this.scope === 'all' || row.state === 'closed') this.setMarker(channel, marker);
       }
       if (openHead !== undefined) this.enqueueHead(repo, row);
     }
 
-    out.push(...this.commentCandidates(repo, await this.api.listIssueCommentsSince(repo, since), 'issue_comment', receivedAt));
-    out.push(
-      ...this.commentCandidates(repo, await this.api.listReviewCommentsSince(repo, since), 'review_comment', receivedAt),
-    );
+    let comments = await this.api.listIssueCommentsSince(repo, since);
+    hold(comments);
+    if (this.scope === 'arrivals') {
+      // Posted since the cursor, by someone else: an edit bumps `updated_at`
+      // as a post does, and is no arrival. A row that doesn't say when it
+      // was posted counts as posted when it was last updated.
+      comments = comments.filter((c) => !this.isSelf(c.author) && atOrAfterInstant(c.createdAt ?? c.updatedAt, judgeSince));
+      return { candidates: [...out, ...this.commentCandidates(repo, comments, 'issue_comment', receivedAt)], holdAt };
+    }
+    out.push(...this.commentCandidates(repo, comments, 'issue_comment', receivedAt));
+    const reviewComments = await this.api.listReviewCommentsSince(repo, since);
+    hold(reviewComments);
+    out.push(...this.commentCandidates(repo, reviewComments, 'review_comment', receivedAt));
 
-    return out;
+    return { candidates: out, holdAt };
+  }
+
+  /** What was last recorded for a thread: the durable head memory, or the `arrivals` scope's own. */
+  private marker(channel: string): string | undefined {
+    return (this.scope === 'arrivals' ? this.arrivalMarkers.get(channel) : this.state.polledHead(channel)) ?? undefined;
+  }
+
+  private setMarker(channel: string, value: string): void {
+    if (this.scope === 'all') {
+      this.state.setPolledHead(channel, value);
+      return;
+    }
+    this.arrivalMarkers.delete(channel);
+    this.arrivalMarkers.set(channel, value);
+    if (this.arrivalMarkers.size > ARRIVALS_MARKER_MEMORY) {
+      const oldest = this.arrivalMarkers.keys().next();
+      if (!oldest.done) this.arrivalMarkers.delete(oldest.value);
+    }
+  }
+
+  /**
+   * The `arrivals` scope's verdict on an issue row's event: an opening by
+   * someone else as it is, a reopen as `issue.reopened`, or for a pull
+   * request `pull.opened`, since the vocabulary has no reopen for one, and
+   * null for anything else. A reopen is an open row whose last recorded
+   * marker was a close; the row doesn't say who reopened it, so its actor is
+   * the author, as every polled edit's is, and it isn't left out as the
+   * user's own.
+   */
+  private arrival(
+    repo: RepoRef,
+    event: NormalizedEvent | null,
+    row: PolledIssue,
+    previous: string | undefined,
+    receivedAt: string,
+  ): NormalizedEvent | null {
+    // An opening it has a marker for was seen already, since a catch-up pass
+    // judges openings against an earlier instant than its cursor: it is news
+    // only as a reopen, below.
+    if (event !== null && (event.kind === 'issue.opened' || event.kind === 'pull.opened') && previous === undefined) {
+      return this.isSelf(event.actor) ? null : event;
+    }
+    const reopened = row.state === 'open' && previous !== undefined && (previous === 'closed' || previous.startsWith('issue:closed:'));
+    if (!reopened) return null;
+    // Built as an opening (since = its creation), so a pull request whose
+    // head the adapter didn't read, which normalizes to nothing, still has one.
+    const built = event ?? normalizePolledIssue(repo, row, receivedAt, row.createdAt);
+    return built === null ? null : { ...built, kind: row.isPullRequest ? 'pull.opened' : 'issue.reopened' };
+  }
+
+  private isSelf(actor: { login: string } | undefined): boolean {
+    return this.login !== '' && actor !== undefined && actor.login.toLowerCase() === this.login;
   }
 
   // ── The check backlog ──

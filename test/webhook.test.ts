@@ -399,6 +399,7 @@ function config(overrides: Partial<Config> = {}): Config {
     webhookPort: 8081,
     webhookPath: '/github/webhook',
     pollIntervalMs: 0,
+    ownedRepoPoll: 'off',
     repos: [TEST_REPO],
     prBaseAllow: ['dev'],
     stateFile: null,

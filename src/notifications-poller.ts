@@ -157,6 +157,12 @@ export interface NotificationsPollerOptions {
   repos: readonly RepoRef[];
   /** The token's login: whose open pull requests have their checks looked up. Without it, none are. */
   login?: string;
+  /**
+   * GITHUB_OWNED_REPO_POLL=auto: the owned-repository poll (owned-repos.ts),
+   * run at the end of each pass that met no rate limit, so it never runs
+   * beside this one. What it delivers is counted in this pass's result.
+   */
+  ownedRepos?: { pollOnce(seen: ReadonlySet<string>): Promise<{ delivered: NormalizedEvent[]; duplicates: number }> };
   onEvent: EventListener;
   logger?: Logger;
   /** Overridable in tests. */
@@ -364,6 +370,7 @@ export class NotificationsPoller {
   private readonly configuredIntervalMs: number;
   private readonly repos: readonly RepoRef[];
   private readonly login: string;
+  private readonly ownedRepos: NotificationsPollerOptions['ownedRepos'];
   private readonly onEvent: EventListener;
   private readonly logger: Logger;
   private readonly now: () => Date;
@@ -387,6 +394,7 @@ export class NotificationsPoller {
     this.configuredIntervalMs = opts.intervalMs;
     this.repos = opts.repos;
     this.login = opts.login ?? '';
+    this.ownedRepos = opts.ownedRepos;
     this.onEvent = opts.onEvent;
     this.logger = opts.logger ?? silentLogger();
     this.now = opts.now ?? (() => new Date());
@@ -596,6 +604,20 @@ export class NotificationsPoller {
       result.delivered.push(...checks.delivered);
       result.duplicates += checks.duplicates;
       result.checkLookups = checks.lookups;
+      if (this.ownedRepos && checks.rateLimited) {
+        this.logger.warn('owned-repo poll: GitHub rate-limited a check lookup, so the owned repositories wait for the next pass', {});
+      } else if (this.ownedRepos) {
+        try {
+          // What this pass delivered, which the bounded ring may no longer hold.
+          const owned = await this.ownedRepos.pollOnce(alreadySeen);
+          result.delivered.push(...owned.delivered);
+          result.duplicates += owned.duplicates;
+        } catch (err) {
+          this.logger.warn('owned-repo poll: the pass failed; its cursor stays, so the next pass reads the same span again', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
 
     const next = page.notModified ? since : nextWatermark(page, since);
@@ -760,8 +782,8 @@ export class NotificationsPoller {
   private async pollOwnChecks(
     receivedAt: string,
     alreadySeen: Set<string>,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number }> {
-    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0 };
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number; rateLimited: boolean }> {
+    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0, rateLimited: false };
     if (!this.login) return out;
     let pulls: OwnPull[];
     try {
@@ -770,6 +792,7 @@ export class NotificationsPoller {
       this.logger.warn('notifications: listing the token user\'s open pull requests failed; their checks are looked up next pass', {
         error: err instanceof Error ? err.message : String(err),
       });
+      out.rateLimited = isRateLimit(err);
       return out;
     }
     const open = new Set(pulls.map((pull) => channelId({ repo: pull.repo, number: pull.number, kind: 'pull' })));
@@ -808,6 +831,7 @@ export class NotificationsPoller {
         const error = err instanceof Error ? err.message : String(err);
         if (isRateLimit(err)) {
           this.logger.warn('notifications: GitHub rate-limited a check lookup, so this pass looked up no more', { channel, error });
+          out.rateLimited = true;
           break;
         }
         tried += 1;

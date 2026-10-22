@@ -582,7 +582,7 @@ export class FakeGitHubApi implements GitHubApi {
       if (!this.inRepo(repo, k)) continue;
       const number = Number(k.slice(k.indexOf('#') + 1));
       for (const c of list) {
-        if (c.updatedAt > since) rows.push({ id: c.id, number, author: c.author, body: c.body, updatedAt: c.updatedAt, html_url: c.html_url });
+        if (c.updatedAt > since) rows.push({ id: c.id, number, author: c.author, body: c.body, updatedAt: c.updatedAt, createdAt: c.createdAt, html_url: c.html_url });
       }
     }
     return rows.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));

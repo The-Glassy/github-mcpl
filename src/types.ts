@@ -424,6 +424,11 @@ export interface PolledComment {
   author: EventActor;
   body: string;
   updatedAt: string;
+  /**
+   * When it was posted. The owned-repository poll (owned-repos.ts) tells a new
+   * comment from an edited one by it; absent where the source doesn't say.
+   */
+  createdAt?: string;
   html_url: string;
   /** Review comments only. */
   path?: string;
@@ -1054,6 +1059,14 @@ export interface Config {
    */
   pollIntervalMs: number;
   /**
+   * GITHUB_OWNED_REPO_POLL, contributor mode only: `auto` (the default) also
+   * polls the repositories in GITHUB_REPOS that the token's user administers
+   * or maintains for issues and pull requests opened or reopened and comments
+   * posted by others (owned-repos.ts); `off` keeps the notifications poller
+   * alone. Always `off` in App mode, whose repository poll sees all of that.
+   */
+  ownedRepoPoll: 'auto' | 'off';
+  /**
    * GITHUB_REPOS, the write allow-list. In App mode several repositories are
    * accepted as long as they share one owner, which is one App installation
    * and so one token; a second owner is a second server process. In
@@ -1085,6 +1098,7 @@ export const ENV_VARS = [
   'GITHUB_WEBHOOK_PORT',
   'GITHUB_WEBHOOK_PATH',
   'GITHUB_POLL_INTERVAL_MS',
+  'GITHUB_OWNED_REPO_POLL',
   'GITHUB_REPOS',
   'GITHUB_PR_BASE_ALLOW',
   'GITHUB_STATE_FILE',
@@ -1302,6 +1316,24 @@ export function readConfig(env: Env = process.env): Config {
     }
   }
 
+  // ── Owned-repository poll: contributor mode only, on unless turned off ──
+  let ownedRepoPoll: 'auto' | 'off' = authMode === 'token' ? 'auto' : 'off';
+  const rawOwned = env.GITHUB_OWNED_REPO_POLL?.trim().toLowerCase();
+  if (rawOwned) {
+    if (rawOwned !== 'auto' && rawOwned !== 'off') {
+      problems.push(`GITHUB_OWNED_REPO_POLL: must be "auto" or "off", got "${env.GITHUB_OWNED_REPO_POLL?.trim()}"`);
+    } else if (authMode === 'app') {
+      if (rawOwned === 'auto') {
+        problems.push(
+          'GITHUB_OWNED_REPO_POLL: contributor mode only (GITHUB_TOKEN_FILE); App mode\'s repository poll ' +
+            '(GITHUB_POLL_INTERVAL_MS) already reads every issue, pull request and comment',
+        );
+      }
+    } else {
+      ownedRepoPoll = rawOwned;
+    }
+  }
+
   const repos: RepoRef[] = [];
   const rawRepos = csv(env.GITHUB_REPOS);
   if (env.GITHUB_REPOS === undefined) {
@@ -1364,6 +1396,7 @@ export function readConfig(env: Env = process.env): Config {
     webhookPort,
     webhookPath,
     pollIntervalMs,
+    ownedRepoPoll,
     repos,
     prBaseAllow,
     stateFile: env.GITHUB_STATE_FILE?.trim() || null,
