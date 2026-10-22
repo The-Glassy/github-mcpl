@@ -615,10 +615,11 @@ export class Poller {
     previous: string | undefined,
     receivedAt: string,
   ): NormalizedEvent | null {
-    // An opening it has a marker for was delivered (or left out) already: a
-    // catch-up pass judges openings against an earlier instant than its cursor.
-    if (event !== null && (event.kind === 'issue.opened' || event.kind === 'pull.opened')) {
-      return previous !== undefined || this.isSelf(event.actor) ? null : event;
+    // An opening it has a marker for was seen already, since a catch-up pass
+    // judges openings against an earlier instant than its cursor: it is news
+    // only as a reopen, below.
+    if (event !== null && (event.kind === 'issue.opened' || event.kind === 'pull.opened') && previous === undefined) {
+      return this.isSelf(event.actor) ? null : event;
     }
     const reopened = row.state === 'open' && previous !== undefined && (previous === 'closed' || previous.startsWith('issue:closed:'));
     if (!reopened) return null;

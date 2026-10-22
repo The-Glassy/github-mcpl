@@ -596,3 +596,19 @@ test('a rate-limited search for the user\'s pull requests holds the owned-reposi
   await r.poller.pollOnce();
   assert.ok(!github.calls.some((c) => c.startsWith('permissions')));
 });
+
+test('a thread opened, closed and reopened within one window arrives as opened, then reopened, each once', async () => {
+  const r = rig();
+  r.github.setIssue(OWNED, issueRow(9));
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:01:00.000Z');
+  r.github.setIssue(OWNED, issueRow(9, { state: 'closed', updatedAt: '2026-10-22T10:00:20Z' }));
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:02:00.000Z');
+  r.github.setIssue(OWNED, issueRow(9, { updatedAt: '2026-10-22T10:01:20Z' }));
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:03:00.000Z');
+  r.github.setIssue(OWNED, issueRow(9, { updatedAt: '2026-10-22T10:02:20Z' }));
+  await r.owned.pollOnce();
+  assert.deepEqual(kinds(r.events), ['issue.opened #9', 'issue.reopened #9']);
+});
