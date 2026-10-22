@@ -162,7 +162,7 @@ export interface NotificationsPollerOptions {
    * run at the end of each pass that met no rate limit, so it never runs
    * beside this one. What it delivers is counted in this pass's result.
    */
-  ownedRepos?: { pollOnce(): Promise<{ delivered: NormalizedEvent[]; duplicates: number }> };
+  ownedRepos?: { pollOnce(seen: ReadonlySet<string>): Promise<{ delivered: NormalizedEvent[]; duplicates: number }> };
   onEvent: EventListener;
   logger?: Logger;
   /** Overridable in tests. */
@@ -604,9 +604,12 @@ export class NotificationsPoller {
       result.delivered.push(...checks.delivered);
       result.duplicates += checks.duplicates;
       result.checkLookups = checks.lookups;
-      if (this.ownedRepos) {
+      if (this.ownedRepos && checks.rateLimited) {
+        this.logger.warn('owned-repo poll: GitHub rate-limited a check lookup, so the owned repositories wait for the next pass', {});
+      } else if (this.ownedRepos) {
         try {
-          const owned = await this.ownedRepos.pollOnce();
+          // What this pass delivered, which the bounded ring may no longer hold.
+          const owned = await this.ownedRepos.pollOnce(alreadySeen);
           result.delivered.push(...owned.delivered);
           result.duplicates += owned.duplicates;
         } catch (err) {
@@ -779,8 +782,8 @@ export class NotificationsPoller {
   private async pollOwnChecks(
     receivedAt: string,
     alreadySeen: Set<string>,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number }> {
-    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0 };
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number; rateLimited: boolean }> {
+    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0, rateLimited: false };
     if (!this.login) return out;
     let pulls: OwnPull[];
     try {
@@ -827,6 +830,7 @@ export class NotificationsPoller {
         const error = err instanceof Error ? err.message : String(err);
         if (isRateLimit(err)) {
           this.logger.warn('notifications: GitHub rate-limited a check lookup, so this pass looked up no more', { channel, error });
+          out.rateLimited = true;
           break;
         }
         tried += 1;

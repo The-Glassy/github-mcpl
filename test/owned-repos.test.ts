@@ -19,7 +19,7 @@ import { NotificationsPoller, type NotificationsPollerApi } from '../src/notific
 import { OWNED_REPO_RECHECK_MS, OwnedRepoPoll, type OwnedRepoApi } from '../src/owned-repos.js';
 import { Poller } from '../src/poller.js';
 import { GithubState } from '../src/state.js';
-import { GitHubApiError, type NotificationRow, type NotificationsPage, type OwnPull } from '../src/github-adapter.js';
+import { GitHubApiError, POLL_MAX_ENTRIES, type NotificationRow, type NotificationsPage, type OwnPull } from '../src/github-adapter.js';
 import {
   ConfigError,
   MIN_POLL_INTERVAL_MS,
@@ -258,10 +258,10 @@ test('an issue or pull request someone else opened arrives as opened; the user\'
   r.github.setIssue(OWNED, pullRow(10, { createdAt: '2026-10-22T09:59:35Z', updatedAt: '2026-10-22T09:59:35Z' }));
   r.github.setIssue(OWNED, issueRow(11, { author: SELF }));
   const result = await r.owned.pollOnce();
+  assert.equal(result.ran, true);
   assert.deepEqual(kinds(r.events), ['issue.opened #9', 'pull.opened #10']);
   assert.equal(r.events[0]?.actor?.login, OTHER.login);
   assert.equal(r.events[0]?.id, `poll:issue:9000:2026-10-22T09:59:30Z`);
-  assert.equal(result.cursorAdvanced, true);
   assert.equal(r.state.lastPollAt(), START);
 });
 
@@ -289,7 +289,6 @@ test('an edit and a close are left out, and the close is remembered, so a later 
   r.github.setIssue(OWNED, issueRow(9, { createdAt: BEFORE_START, state: 'closed', updatedAt: '2026-10-22T10:00:30Z' }));
   await r.owned.pollOnce();
   assert.deepEqual(r.events, []);
-  assert.match(r.state.polledHead(channelId({ repo: OWNED, number: 9, kind: 'issue' })) ?? '', /^issue:closed:/);
 
   r.setNow('2026-10-22T10:02:00.000Z');
   r.github.setIssue(OWNED, issueRow(9, { createdAt: BEFORE_START, state: 'open', updatedAt: '2026-10-22T10:01:30Z' }));
@@ -314,13 +313,56 @@ test('a reopened pull request arrives as pull.opened, the vocabulary having no r
   assert.deepEqual(kinds(r.events), ['pull.opened #10']);
 });
 
-test('the arrivals scope records no marker for an open thread it leaves out', async () => {
+test('the arrivals scope writes nothing to the head memory that holds the notifications poller\'s cursors', async () => {
   const r = rig();
+  r.github.setIssue(OWNED, issueRow(8));
   r.github.setIssue(OWNED, issueRow(9, { createdAt: BEFORE_START, title: 'edited' }));
-  r.github.setIssue(OWNED, pullRow(10, { createdAt: BEFORE_START }));
+  r.github.setIssue(OWNED, pullRow(10, { createdAt: BEFORE_START, state: 'closed' }));
   await r.owned.pollOnce();
-  assert.equal(r.state.polledHead(channelId({ repo: OWNED, number: 9, kind: 'issue' })), null);
-  assert.equal(r.state.polledHead(channelId({ repo: OWNED, number: 10, kind: 'pull' })), null);
+  assert.deepEqual(kinds(r.events), ['issue.opened #8']);
+  for (const [number, kind] of [[8, 'issue'], [9, 'issue'], [10, 'pull']] as const) {
+    assert.equal(r.state.polledHead(channelId({ repo: OWNED, number, kind })), null);
+  }
+});
+
+test('a reopened pull request whose head the adapter didn\'t read arrives, and only once', async () => {
+  const r = rig();
+  r.github.setIssue(OWNED, pullRow(10, { createdAt: BEFORE_START, state: 'closed', headSha: undefined }));
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:01:00.000Z');
+  r.github.setIssue(OWNED, pullRow(10, { createdAt: BEFORE_START, headSha: undefined, updatedAt: '2026-10-22T10:00:30Z' }));
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:02:00.000Z');
+  r.github.setIssue(OWNED, pullRow(10, { createdAt: BEFORE_START, headSha: undefined, updatedAt: '2026-10-22T10:01:30Z' }));
+  await r.owned.pollOnce();
+  assert.deepEqual(kinds(r.events), ['pull.opened #10']);
+});
+
+test('a list cut at the adapter\'s cap holds the cursor at its last row, so the rest arrive next pass', async () => {
+  const r = rig();
+  const at = (i: number): string => new Date(Date.parse('2026-10-22T09:59:01Z') + i * 100).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const all = Array.from({ length: POLL_MAX_ENTRIES + 5 }, (_, i) => commentRow(i + 1, 9, { createdAt: at(i), updatedAt: at(i) }));
+  // The adapter's cap, as the production list applies it: oldest first, then cut.
+  r.github.listIssueCommentsSince = async (_repo, since) =>
+    all.filter((c) => Date.parse(c.updatedAt) >= Date.parse(since)).slice(0, POLL_MAX_ENTRIES);
+  await r.owned.pollOnce();
+  assert.equal(r.events.length, POLL_MAX_ENTRIES);
+  assert.equal(r.state.lastPollAt(), new Date(Date.parse(all[POLL_MAX_ENTRIES - 1]!.updatedAt)).toISOString());
+  assert.ok(r.logs.some((l) => l.startsWith('warn poll cursor moved only to the last row a capped list returned')));
+  r.setNow('2026-10-22T10:01:00.000Z');
+  await r.owned.pollOnce();
+  assert.equal(new Set(r.events.map((e) => e.id)).size, POLL_MAX_ENTRIES + 5, 'every comment, each once');
+  assert.equal(r.events.length, POLL_MAX_ENTRIES + 5);
+});
+
+test('a first start stores its cursor at once, so a pass that never runs or fails doesn\'t move it', async () => {
+  const r = rig();
+  assert.equal(r.state.lastPollAt(), '2026-10-22T09:59:00.000Z');
+  r.github.setIssue(OWNED, issueRow(9));
+  // The first pass comes a minute late: the opening at 09:59:30 is still in its window.
+  r.setNow('2026-10-22T10:01:00.000Z');
+  await r.owned.pollOnce();
+  assert.deepEqual(kinds(r.events), ['issue.opened #9']);
 });
 
 test('App mode\'s scope is unchanged: the same rows bring the edit, the comments and the check lookup', async () => {
@@ -372,25 +414,42 @@ test('only the repositories the user administers or maintains are polled, asked 
   assert.equal(r.logs.filter((l) => l.startsWith('info owned-repo poll: repositories')).length, 2, 'a change is logged once');
 });
 
-test('a failed permissions read keeps the last answer, and a repository never answered for is not polled until it is', async () => {
+test('while a repository was never answered for, no pass runs and the cursor waits, so nothing of its is skipped', async () => {
   const github = new FakeGitHub();
   github.administered.set(repoSlug(OWNED), new GitHubApiError(502, 'Bad Gateway', 'getRepository'));
+  github.setIssue(OWNED, issueRow(9));
   const r = rig({ github });
-  await r.owned.pollOnce();
+  const first = await r.owned.pollOnce();
+  assert.equal(first.ran, false);
   assert.deepEqual(r.owned.polled, []);
   assert.ok(r.logs.some((l) => l.startsWith('warn owned-repo poll: reading a repository\'s permissions failed')));
-  // The cursor keeps up while nothing is polled.
-  assert.equal(r.state.lastPollAt(), START);
+  assert.equal(r.state.lastPollAt(), '2026-10-22T09:59:00.000Z');
 
   github.administered.set(repoSlug(OWNED), true);
   r.setNow('2026-10-22T10:01:00.000Z');
   await r.owned.pollOnce();
   assert.deepEqual(r.owned.polled, [OWNED]);
+  assert.deepEqual(kinds(r.events), ['issue.opened #9']);
 
   github.administered.set(repoSlug(OWNED), new GitHubApiError(502, 'Bad Gateway', 'getRepository'));
   r.setNow(new Date(Date.parse('2026-10-22T10:01:00.000Z') + OWNED_REPO_RECHECK_MS).toISOString());
   await r.owned.pollOnce();
+  assert.deepEqual(r.owned.polled, [OWNED], 'a later failure keeps the last answer');
+});
+
+test('a repository gone or out of reach counts as not administered; a rate limit stops the pass', async () => {
+  const github = new FakeGitHub();
+  github.administered.set(repoSlug(OWNED), true);
+  github.administered.set(repoSlug(UPSTREAM), new GitHubApiError(404, 'Not Found', 'getRepository'));
+  const r = rig({ github, repos: [OWNED, UPSTREAM] });
+  assert.equal((await r.owned.pollOnce()).ran, true);
   assert.deepEqual(r.owned.polled, [OWNED]);
+
+  const limited = new FakeGitHub();
+  limited.administered.set(repoSlug(OWNED), new GitHubApiError(403, 'API rate limit exceeded for user', 'getRepository'));
+  const l = rig({ github: limited });
+  assert.equal((await l.owned.pollOnce()).ran, false);
+  assert.ok(!limited.calls.some((c) => c.startsWith('issues')));
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +533,30 @@ test('the owned-repository pass runs after the notifications pass, and its failu
   const result = await r.poller.pollOnce();
   assert.equal(result.failed, 0);
   assert.ok(r.logs.some((l) => l.startsWith('warn owned-repo poll: the pass failed')));
-  assert.equal(r.state.lastPollAt(), null, 'its cursor stays');
+  assert.equal(r.state.lastPollAt(), '2026-10-22T09:59:00.000Z', 'its cursor stays');
   assert.ok(github.calls.indexOf('list notifications') < github.calls.indexOf(`permissions ${repoSlug(OWNED)}`));
+});
+
+test('a key the notifications pass delivered is not delivered again, though the bounded ring no longer holds it', async () => {
+  const r = rig();
+  r.github.setIssue(OWNED, issueRow(9));
+  const result = await r.owned.pollOnce(new Set(['issue:9000:2026-10-22T09:59:30Z']));
+  assert.deepEqual(r.events, []);
+  assert.equal(result.duplicates, 1);
+});
+
+test('a check lookup GitHub rate-limited holds the owned-repository pass for the next notifications pass', async () => {
+  const github = new FakeGitHub();
+  github.administered.set(repoSlug(OWNED), true);
+  github.listOwnOpenPulls = async () => [
+    { repo: OWNED, number: 3, updatedAt: '2026-10-22T09:00:00Z', html_url: 'https://github.com/The-Glassy/bosun-browser/pull/3' },
+  ];
+  github.getPullHeadSha = async () => 'f'.repeat(40);
+  github.getCheckRuns = async () => {
+    throw new GitHubApiError(403, 'API rate limit exceeded for user', 'getCheckRuns');
+  };
+  const r = notificationsRig(github);
+  await r.poller.pollOnce();
+  assert.ok(!github.calls.some((c) => c.startsWith('permissions')));
+  assert.ok(r.logs.some((l) => l.startsWith('warn owned-repo poll: GitHub rate-limited a check lookup')));
 });

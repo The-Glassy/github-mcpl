@@ -11,9 +11,10 @@
  *
  * **Which repositories.** Each is asked once at start and again an hour after
  * its last answer (`GET /repos/{owner}/{repo}`, whose `permissions` GitHub
- * fills for the token's user). A failed read keeps the last answer, and a
- * repository never answered for counts as not administered; either is asked
- * again on the next pass.
+ * fills for the token's user). A failed read keeps the last answer and is
+ * asked again on the next pass. While a repository has never been answered
+ * for, or GitHub rate-limits a read, no pass runs, so the cursor waits
+ * rather than moving past that repository's rows unread.
  *
  * **When.** The notifications poller calls {@link OwnedRepoPoll.pollOnce} at
  * the end of each of its passes that met no rate limit, so the two never run
@@ -21,14 +22,17 @@
  * dedup ring, and each reads the ring when its pass starts, so a row both
  * see is delivered once.
  *
- * **Durable state.** The repository poll's own: the cursor `lastPollAt`,
- * which contributor mode has no other use for, and each thread's marker in
- * the head memory under its bare channel id (the notifications poller's
- * cursors are under `notif:`). A first start reads from one interval back.
+ * **State.** The repository poll's cursor `lastPollAt`, durable, which
+ * contributor mode has no other use for, and each closed thread's marker in
+ * memory (poller.ts `ARRIVALS_MARKER_MEMORY`), apart from the 200-entry head
+ * memory that holds the notifications poller's thread cursors, so a restart
+ * forgets which threads were closed. A first start's cursor is one interval
+ * before the start, stored at once, so a pass that fails doesn't move it.
  */
 
-import { Poller, type IngressState, type PollerApi, type PollResult } from './poller.js';
-import { repoSlug, silentLogger, type Logger, type RepoRef } from './types.js';
+import { isLastingFailure, isRateLimit } from './github-adapter.js';
+import { Poller, type IngressState, type PollerApi } from './poller.js';
+import { MIN_POLL_INTERVAL_MS, repoSlug, silentLogger, type Logger, type NormalizedEvent, type RepoRef } from './types.js';
 import type { EventListener } from './webhook.js';
 
 /** How long an answer about a repository's permissions stands. */
@@ -84,6 +88,11 @@ export class OwnedRepoPoll {
       logger: this.logger,
       now: this.now,
     });
+    if (opts.state.lastPollAt() === null) {
+      const since = new Date(this.now().getTime() - Math.max(MIN_POLL_INTERVAL_MS, opts.intervalMs)).toISOString();
+      opts.state.setLastPollAt(since);
+      this.logger.info('owned-repo poll: no stored cursor, so delivery begins one interval before this start', { since });
+    }
   }
 
   /** The repositories the last pass polled. */
@@ -97,8 +106,8 @@ export class OwnedRepoPoll {
    * cursor keeps up and a repository that becomes administered starts from
    * now rather than from whenever the last one stopped.
    */
-  async pollOnce(): Promise<PollResult> {
-    await this.refresh();
+  async pollOnce(seen?: ReadonlySet<string>): Promise<{ delivered: NormalizedEvent[]; duplicates: number; ran: boolean }> {
+    if (!(await this.refresh())) return { delivered: [], duplicates: 0, ran: false };
     const polled = this.polled;
     this.poller.setRepos(polled);
     const slugs = polled.map(repoSlug);
@@ -106,7 +115,7 @@ export class OwnedRepoPoll {
       this.logged = slugs.join(',');
       this.logger.info('owned-repo poll: repositories in GITHUB_REPOS the token user administers or maintains', { repos: slugs });
     }
-    const result = await this.poller.pollOnce();
+    const result = await this.poller.pollOnce(seen);
     if (result.delivered.length > 0 || result.failed > 0) {
       this.logger.info('owned-repo poll: pass done', {
         delivered: result.delivered.length,
@@ -114,10 +123,11 @@ export class OwnedRepoPoll {
         failed: result.failed,
       });
     }
-    return result;
+    return { delivered: result.delivered, duplicates: result.duplicates, ran: true };
   }
 
-  private async refresh(): Promise<void> {
+  /** Ask about the repositories that are due. False when a pass mustn't run: one was never answered for, or GitHub rate-limited a read. */
+  private async refresh(): Promise<boolean> {
     const now = this.now().getTime();
     for (const repo of this.repos) {
       const slug = repoSlug(repo);
@@ -126,11 +136,30 @@ export class OwnedRepoPoll {
       try {
         this.answers.set(slug, { administered: await this.api.repoAdministered(repo), at: now });
       } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        if (isLastingFailure(err)) {
+          // Gone or out of the token's reach: nothing there to poll.
+          this.answers.set(slug, { administered: false, at: now });
+          this.logger.warn('owned-repo poll: a repository is gone or out of the token\'s reach, so it is not polled', { repo: slug, error });
+          continue;
+        }
+        if (isRateLimit(err)) {
+          this.logger.warn('owned-repo poll: GitHub rate-limited a permissions read, so this pass polls nothing', { repo: slug, error });
+          return false;
+        }
         this.logger.warn('owned-repo poll: reading a repository\'s permissions failed; the last answer stands and it is asked again next pass', {
           repo: slug,
-          error: err instanceof Error ? err.message : String(err),
+          error,
         });
       }
     }
+    const unanswered = this.repos.filter((repo) => !this.answers.has(repoSlug(repo))).map(repoSlug);
+    if (unanswered.length > 0) {
+      this.logger.warn('owned-repo poll: some repositories were never answered for, so this pass polls nothing and the cursor waits', {
+        repos: unanswered,
+      });
+      return false;
+    }
+    return true;
   }
 }
