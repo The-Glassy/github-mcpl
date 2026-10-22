@@ -347,7 +347,8 @@ test('a list cut at the adapter\'s cap holds the cursor at its last row, so the 
     all.filter((c) => Date.parse(c.updatedAt) >= Date.parse(since)).slice(0, POLL_MAX_ENTRIES);
   await r.owned.pollOnce();
   assert.equal(r.events.length, POLL_MAX_ENTRIES);
-  assert.equal(r.state.lastPollAt(), new Date(Date.parse(all[POLL_MAX_ENTRIES - 1]!.updatedAt)).toISOString());
+  // A second early: a row tied with the last one may sit past the cap.
+  assert.equal(r.state.lastPollAt(), new Date(Date.parse(all[POLL_MAX_ENTRIES - 1]!.updatedAt) - 1000).toISOString());
   assert.ok(r.logs.some((l) => l.startsWith('warn poll cursor moved only to the last row a capped list returned')));
   r.setNow('2026-10-22T10:01:00.000Z');
   await r.owned.pollOnce();
@@ -559,4 +560,39 @@ test('a check lookup GitHub rate-limited holds the owned-repository pass for the
   await r.poller.pollOnce();
   assert.ok(!github.calls.some((c) => c.startsWith('permissions')));
   assert.ok(r.logs.some((l) => l.startsWith('warn owned-repo poll: GitHub rate-limited a check lookup')));
+});
+
+test('a pass catching up on a capped list judges openings and comments against where the backlog began', async () => {
+  const r = rig();
+  const at = (i: number): string => new Date(Date.parse('2026-10-22T09:59:01Z') + i * 100).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  // Every issue opened in the first window; the last few are bumped after it, so the next pass reads them later.
+  const rows = Array.from({ length: POLL_MAX_ENTRIES + 3 }, (_, i) =>
+    issueRow(i + 1, { createdAt: at(i), updatedAt: i >= POLL_MAX_ENTRIES ? '2026-10-22T10:00:30Z' : at(i) }),
+  );
+  const late = commentRow(9001, 1, { createdAt: at(10), updatedAt: '2026-10-22T10:00:30Z' });
+  const comments = Array.from({ length: POLL_MAX_ENTRIES }, (_, i) => commentRow(i + 1, 1, { createdAt: at(i), updatedAt: at(i) }));
+  r.github.listIssuesSince = async (_repo, since) =>
+    rows.filter((x) => Date.parse(x.updatedAt) >= Date.parse(since)).sort((a, b) => Date.parse(a.updatedAt) - Date.parse(b.updatedAt)).slice(0, POLL_MAX_ENTRIES);
+  r.github.listIssueCommentsSince = async (_repo, since) =>
+    [...comments, late].filter((x) => Date.parse(x.updatedAt) >= Date.parse(since)).slice(0, POLL_MAX_ENTRIES);
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:01:00.000Z');
+  await r.owned.pollOnce();
+  r.setNow('2026-10-22T10:02:00.000Z');
+  await r.owned.pollOnce();
+  const opened = r.events.filter((e) => e.kind === 'issue.opened').map((e) => e.thread?.number);
+  assert.equal(opened.length, POLL_MAX_ENTRIES + 3, 'every opening, each once');
+  assert.equal(new Set(opened).size, POLL_MAX_ENTRIES + 3);
+  assert.ok(r.events.some((e) => e.kind === 'comment.created' && e.comment?.id === 9001), 'a comment posted in the backlog and edited after it');
+});
+
+test('a rate-limited search for the user\'s pull requests holds the owned-repository pass too', async () => {
+  const github = new FakeGitHub();
+  github.administered.set(repoSlug(OWNED), true);
+  github.listOwnOpenPulls = async () => {
+    throw new GitHubApiError(403, 'You have exceeded a secondary rate limit', 'listOwnOpenPulls');
+  };
+  const r = notificationsRig(github);
+  await r.poller.pollOnce();
+  assert.ok(!github.calls.some((c) => c.startsWith('permissions')));
 });

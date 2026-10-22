@@ -792,6 +792,7 @@ export class NotificationsPoller {
       this.logger.warn('notifications: listing the token user\'s open pull requests failed; their checks are looked up next pass', {
         error: err instanceof Error ? err.message : String(err),
       });
+      out.rateLimited = isRateLimit(err);
       return out;
     }
     const open = new Set(pulls.map((pull) => channelId({ repo: pull.repo, number: pull.number, kind: 'pull' })));

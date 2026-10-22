@@ -227,6 +227,13 @@ export class Poller {
   private readonly login: string;
   /** The `arrivals` scope's markers, by channel, oldest first. */
   private readonly arrivalMarkers = new Map<string, string>();
+  /**
+   * While a capped list holds the cursor back, where the backlog began: the
+   * `arrivals` scope judges an opening or a comment new against it, since a
+   * row first read on a later pass may have been created before that pass's
+   * cursor. Cleared by the first pass that reads to its start.
+   */
+  private catchUpSince: string | null = null;
   private readonly state: IngressState;
   private readonly configuredIntervalMs: number;
   private readonly onEvent: EventListener;
@@ -365,8 +372,9 @@ export class Poller {
     // Where the cursor may move to: the pass's start, or, when a list stopped
     // at the adapter's cap, the last row it got, so the rest come next pass.
     let advanceTo = receivedAt;
+    const judgeSince = this.scope === 'arrivals' ? (this.catchUpSince ?? since) : since;
     for (const repo of this.repos) {
-      const rows = await this.collectRows(repo, since, receivedAt);
+      const rows = await this.collectRows(repo, since, judgeSince, receivedAt);
       candidates.push(...rows.candidates);
       if (rows.holdAt !== null && rows.holdAt < advanceTo) advanceTo = rows.holdAt;
     }
@@ -452,6 +460,7 @@ export class Poller {
 
     if (result.failed === 0) {
       this.state.setLastPollAt(advanceTo);
+      this.catchUpSince = advanceTo === receivedAt ? null : judgeSince;
       if (advanceTo !== receivedAt) {
         this.logger.warn('poll cursor moved only to the last row a capped list returned; the rest come next pass', {
           since,
@@ -487,18 +496,27 @@ export class Poller {
   private async collectRows(
     repo: RepoRef,
     since: string,
+    judgeSince: string,
     receivedAt: string,
   ): Promise<{ candidates: Candidate[]; holdAt: string | null }> {
     const out: Candidate[] = [];
-    // A list the adapter cut at its cap holds the cursor at its last row
-    // (rows come oldest first); the ring drops the rows read twice.
+    // A list the adapter cut at its cap holds the cursor a second before its
+    // last row (rows come oldest first, stamped in whole seconds, and `since`
+    // may exclude its own instant), so rows tied with it come again; the ring
+    // drops the rows read twice.
     let holdAt: string | null = null;
     const hold = (rows: readonly { updatedAt: string }[]): void => {
       const last = rows[rows.length - 1]?.updatedAt;
       if (rows.length < POLL_MAX_ENTRIES || last === undefined) return;
-      const at = Date.parse(last);
+      const at = Date.parse(last) - 1000;
       // A cap filled within one second would hold the cursor in place for good: let it move.
-      if (!Number.isFinite(at) || at <= Date.parse(since)) return;
+      if (!Number.isFinite(at) || at <= Date.parse(since)) {
+        this.logger.warn('poll list capped within one second of its cursor; the cursor moves on and rows past the cap may be missed', {
+          repo: repoSlug(repo),
+          since,
+        });
+        return;
+      }
       if (holdAt === null || at < Date.parse(holdAt)) holdAt = new Date(at).toISOString();
     };
 
@@ -510,7 +528,7 @@ export class Poller {
       // real change into an event and drops the row a comment only bumped.
       const channel = channelId({ repo, number: row.number, kind: row.isPullRequest ? 'pull' : 'issue' });
       const previous = this.marker(channel);
-      const normalized = normalizePolledIssue(repo, row, receivedAt, since, previous);
+      const normalized = normalizePolledIssue(repo, row, receivedAt, judgeSince, previous);
       const event = this.scope === 'arrivals' ? this.arrival(repo, normalized, row, previous, receivedAt) : normalized;
       // A reopened pull request whose head the adapter didn't read still
       // needs its close replaced, or each later bump would reopen it again.
@@ -552,7 +570,7 @@ export class Poller {
       // Posted since the cursor, by someone else: an edit bumps `updated_at`
       // as a post does, and is no arrival. A row that doesn't say when it
       // was posted counts as posted when it was last updated.
-      comments = comments.filter((c) => !this.isSelf(c.author) && atOrAfterInstant(c.createdAt ?? c.updatedAt, since));
+      comments = comments.filter((c) => !this.isSelf(c.author) && atOrAfterInstant(c.createdAt ?? c.updatedAt, judgeSince));
       return { candidates: [...out, ...this.commentCandidates(repo, comments, 'issue_comment', receivedAt)], holdAt };
     }
     out.push(...this.commentCandidates(repo, comments, 'issue_comment', receivedAt));
@@ -597,8 +615,10 @@ export class Poller {
     previous: string | undefined,
     receivedAt: string,
   ): NormalizedEvent | null {
+    // An opening it has a marker for was delivered (or left out) already: a
+    // catch-up pass judges openings against an earlier instant than its cursor.
     if (event !== null && (event.kind === 'issue.opened' || event.kind === 'pull.opened')) {
-      return this.isSelf(event.actor) ? null : event;
+      return previous !== undefined || this.isSelf(event.actor) ? null : event;
     }
     const reopened = row.state === 'open' && previous !== undefined && (previous === 'closed' || previous.startsWith('issue:closed:'));
     if (!reopened) return null;
