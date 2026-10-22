@@ -157,6 +157,12 @@ export interface NotificationsPollerOptions {
   repos: readonly RepoRef[];
   /** The token's login: whose open pull requests have their checks looked up. Without it, none are. */
   login?: string;
+  /**
+   * GITHUB_OWNED_REPO_POLL=auto: the owned-repository poll (owned-repos.ts),
+   * run at the end of each pass that met no rate limit, so it never runs
+   * beside this one. What it delivers is counted in this pass's result.
+   */
+  ownedRepos?: { pollOnce(): Promise<{ delivered: NormalizedEvent[]; duplicates: number }> };
   onEvent: EventListener;
   logger?: Logger;
   /** Overridable in tests. */
@@ -364,6 +370,7 @@ export class NotificationsPoller {
   private readonly configuredIntervalMs: number;
   private readonly repos: readonly RepoRef[];
   private readonly login: string;
+  private readonly ownedRepos: NotificationsPollerOptions['ownedRepos'];
   private readonly onEvent: EventListener;
   private readonly logger: Logger;
   private readonly now: () => Date;
@@ -387,6 +394,7 @@ export class NotificationsPoller {
     this.configuredIntervalMs = opts.intervalMs;
     this.repos = opts.repos;
     this.login = opts.login ?? '';
+    this.ownedRepos = opts.ownedRepos;
     this.onEvent = opts.onEvent;
     this.logger = opts.logger ?? silentLogger();
     this.now = opts.now ?? (() => new Date());
@@ -596,6 +604,17 @@ export class NotificationsPoller {
       result.delivered.push(...checks.delivered);
       result.duplicates += checks.duplicates;
       result.checkLookups = checks.lookups;
+      if (this.ownedRepos) {
+        try {
+          const owned = await this.ownedRepos.pollOnce();
+          result.delivered.push(...owned.delivered);
+          result.duplicates += owned.duplicates;
+        } catch (err) {
+          this.logger.warn('owned-repo poll: the pass failed; its cursor stays, so the next pass reads the same span again', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
     }
 
     const next = page.notModified ? since : nextWatermark(page, since);

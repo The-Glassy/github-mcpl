@@ -1886,6 +1886,20 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
+   * Contributor mode: whether the token's user administers or maintains
+   * `repo`, from `GET /repos/{owner}/{repo}`'s `permissions`, which GitHub
+   * fills for the authenticated user. Absent permissions answer false. A
+   * failed read throws, so the caller can keep what it knew.
+   */
+  async repoAdministered(repo: RepoRef): Promise<boolean> {
+    return this.call('getRepository', async () => {
+      const res = await this.octokit.request('GET /repos/{owner}/{repo}', { owner: repo.owner, repo: repo.name });
+      const permissions = (res.data as { permissions?: { admin?: unknown; maintain?: unknown } | null }).permissions;
+      return permissions?.admin === true || permissions?.maintain === true;
+    });
+  }
+
+  /**
    * App mode: the App's own identity. `GET /app` is JWT-authenticated and
    * answers with the App's slug; the login that appears as a comment author
    * is that slug with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds.
@@ -2160,6 +2174,7 @@ function mapPolledComment(row: ApiComment, number: number): PolledComment {
     updatedAt: row.updated_at ?? row.created_at ?? '',
     html_url: row.html_url ?? '',
   };
+  if (row.created_at != null) polled.createdAt = row.created_at;
   if (row.path != null) polled.path = row.path;
   if (row.in_reply_to_id != null) polled.inReplyTo = row.in_reply_to_id;
   return polled;

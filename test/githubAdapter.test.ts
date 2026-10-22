@@ -2330,6 +2330,21 @@ test('repoSpellingProblems names an entry GitHub spells otherwise, and one the t
   assert.ok(r.logs.some((line) => line.includes('unchecked against GitHub') && line.includes('someone/busy')));
 });
 
+test('repoAdministered reads the token user\'s admin or maintain permission, and throws when GitHub doesn\'t answer', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/the-glassy/owned', { body: { full_name: 'The-Glassy/owned', permissions: { admin: true, maintain: true, push: true } } });
+    fake.on('GET /repos/team/maintained', { body: { permissions: { admin: false, maintain: true, push: true } } });
+    fake.on('GET /repos/anima-research/rayforce', { body: { permissions: { admin: false, maintain: false, push: true } } });
+    fake.on('GET /repos/someone/public', { body: { full_name: 'someone/public' } });
+    fake.on('GET /repos/someone/busy', { status: 502, body: { message: 'Bad gateway' } });
+  });
+  assert.equal(await r.adapter.repoAdministered({ owner: 'the-glassy', name: 'owned' }), true);
+  assert.equal(await r.adapter.repoAdministered({ owner: 'team', name: 'maintained' }), true);
+  assert.equal(await r.adapter.repoAdministered(REPO), false, 'push alone is not enough');
+  assert.equal(await r.adapter.repoAdministered({ owner: 'someone', name: 'public' }), false, 'no permissions answer false');
+  await assert.rejects(r.adapter.repoAdministered({ owner: 'someone', name: 'busy' }), GitHubApiError);
+});
+
 test('a request that fails before GitHub answers is told apart from an answer', async () => {
   const r = await tokenRig((fake) => {
     fake.on('GET /repos/anima-research/rayforce/issues/7', { body: {} });

@@ -20,6 +20,7 @@ import { McplConnection } from '@animalabs/mcpl-core';
 import { GitHubAdapter } from './github-adapter.js';
 import { CheckGate } from './normalize.js';
 import { NotificationsPoller } from './notifications-poller.js';
+import { OwnedRepoPoll } from './owned-repos.js';
 import { Poller } from './poller.js';
 import { GitHubMcplServer } from './server.js';
 import { GithubState } from './state.js';
@@ -115,18 +116,32 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
 
   // Contributor mode has one ingress, the notifications poller, and no
   // webhook (readConfig already refused GITHUB_WEBHOOK_PORT in this mode).
+  // The owned-repository poll runs inside its passes, not on a timer of its own.
   if (config.authMode === 'token') {
+    const ownedRepos =
+      config.ownedRepoPoll === 'auto'
+        ? new OwnedRepoPoll({
+            api,
+            repos: config.repos,
+            login: config.botLogin,
+            state,
+            intervalMs: config.pollIntervalMs,
+            onEvent: server.onEvent,
+            logger: log,
+          })
+        : undefined;
     const notifications = new NotificationsPoller({
       api,
       state,
       intervalMs: config.pollIntervalMs,
       repos: config.repos,
       login: config.botLogin,
+      ...(ownedRepos ? { ownedRepos } : {}),
       onEvent: server.onEvent,
       logger: log,
     });
     notifications.start();
-    log.info('polling notifications', { intervalMs: config.pollIntervalMs });
+    log.info('polling notifications', { intervalMs: config.pollIntervalMs, ownedRepoPoll: config.ownedRepoPoll });
     return { server, running: { webhook: null, poller: null, notifications, state } };
   }
 
@@ -220,7 +235,7 @@ async function main(): Promise<void> {
     webhook: config.webhookPort === null ? 'off' : `:${config.webhookPort}${config.webhookPath}`,
     poll:
       config.authMode === 'token'
-        ? `notifications ${config.pollIntervalMs}ms`
+        ? `notifications ${config.pollIntervalMs}ms${config.ownedRepoPoll === 'auto' ? ' + owned repos' : ''}`
         : config.pollIntervalMs === 0
           ? 'off'
           : `${config.pollIntervalMs}ms`,
